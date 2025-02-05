@@ -1,18 +1,22 @@
+import { randomUUID } from 'node:crypto';
+import { rm } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { Readable } from 'node:stream';
+
 import type * as storage from '@crawlee/types';
 import { s } from '@sapphire/shapeshift';
-import mime from 'mime-types';
-import { randomUUID } from 'node:crypto';
-import { Readable } from 'node:stream';
-import { resolve } from 'node:path';
-import { rm } from 'node:fs/promises';
 import { move } from 'fs-extra';
-import type { MemoryStorage } from '../index';
+import mime from 'mime-types';
+
+import { scheduleBackgroundTask } from '../background-handler';
 import { maybeParseBody } from '../body-parser';
+import { findOrCacheKeyValueStoreByPossibleId } from '../cache-helpers';
 import { DEFAULT_API_PARAM_LIMIT, StorageTypes } from '../consts';
+import type { StorageImplementation } from '../fs/common';
+import { createKeyValueStorageImplementation } from '../fs/key-value-store';
+import type { MemoryStorage } from '../index';
 import { isBuffer, isStream } from '../utils';
 import { BaseClient } from './common/base-client';
-import { sendWorkerMessage } from '../workers/instance';
-import { findOrCacheKeyValueStoreByPossibleId } from '../cache-helpers';
 
 const DEFAULT_LOCAL_FILE_EXTENSION = 'bin';
 
@@ -37,7 +41,7 @@ export class KeyValueStoreClient extends BaseClient {
     modifiedAt = new Date();
     keyValueStoreDirectory: string;
 
-    private readonly keyValueEntries = new Map<string, InternalKeyRecord>();
+    private readonly keyValueEntries = new Map<string, StorageImplementation<InternalKeyRecord>>();
     private readonly client: MemoryStorage;
 
     constructor(options: KeyValueStoreClientOptions) {
@@ -59,9 +63,11 @@ export class KeyValueStoreClient extends BaseClient {
     }
 
     async update(newFields: storage.KeyValueStoreClientUpdateOptions = {}): Promise<storage.KeyValueStoreInfo> {
-        const parsed = s.object({
-            name: s.string.lengthGreaterThan(0).optional,
-        }).parse(newFields);
+        const parsed = s
+            .object({
+                name: s.string.lengthGreaterThan(0).optional,
+            })
+            .parse(newFields);
 
         // Check by id
         const existingStoreById = await findOrCacheKeyValueStoreByPossibleId(this.client, this.name ?? this.id);
@@ -76,7 +82,9 @@ export class KeyValueStoreClient extends BaseClient {
         }
 
         // Check that name is not in use already
-        const existingStoreByName = this.client.keyValueStoresHandled.find((store) => store.name?.toLowerCase() === parsed.name!.toLowerCase());
+        const existingStoreByName = this.client.keyValueStoresHandled.find(
+            (store) => store.name?.toLowerCase() === parsed.name!.toLowerCase(),
+        );
 
         if (existingStoreByName) {
             this.throwOnDuplicateEntry(StorageTypes.KeyValueStore, 'name', parsed.name);
@@ -86,7 +94,10 @@ export class KeyValueStoreClient extends BaseClient {
 
         const previousDir = existingStoreById.keyValueStoreDirectory;
 
-        existingStoreById.keyValueStoreDirectory = resolve(this.client.keyValueStoresDirectory, parsed.name ?? existingStoreById.name ?? existingStoreById.id);
+        existingStoreById.keyValueStoreDirectory = resolve(
+            this.client.keyValueStoresDirectory,
+            parsed.name ?? existingStoreById.name ?? existingStoreById.id,
+        );
 
         await move(previousDir, existingStoreById.keyValueStoreDirectory, { overwrite: true });
 
@@ -108,13 +119,12 @@ export class KeyValueStoreClient extends BaseClient {
     }
 
     async listKeys(options: storage.KeyValueStoreClientListOptions = {}): Promise<storage.KeyValueStoreClientListData> {
-        const {
-            limit = DEFAULT_API_PARAM_LIMIT,
-            exclusiveStartKey,
-        } = s.object({
-            limit: s.number.greaterThan(0).optional,
-            exclusiveStartKey: s.string.optional,
-        }).parse(options);
+        const { limit = DEFAULT_API_PARAM_LIMIT, exclusiveStartKey } = s
+            .object({
+                limit: s.number.greaterThan(0).optional,
+                exclusiveStartKey: s.string.optional,
+            })
+            .parse(options);
 
         // Check by id
         const existingStoreById = await findOrCacheKeyValueStoreByPossibleId(this.client, this.name ?? this.id);
@@ -125,7 +135,9 @@ export class KeyValueStoreClient extends BaseClient {
 
         const items = [];
 
-        for (const record of existingStoreById.keyValueEntries.values()) {
+        for (const storageEntry of existingStoreById.keyValueEntries.values()) {
+            const record = await storageEntry.get();
+
             const size = Buffer.byteLength(record.value);
             items.push({
                 key: record.key,
@@ -150,9 +162,7 @@ export class KeyValueStoreClient extends BaseClient {
         const lastItemInStore = items[items.length - 1];
         const lastSelectedItem = limitedItems[limitedItems.length - 1];
         const isLastSelectedItemAbsolutelyLast = lastItemInStore === lastSelectedItem;
-        const nextExclusiveStartKey = isLastSelectedItemAbsolutelyLast
-            ? undefined
-            : lastSelectedItem.key;
+        const nextExclusiveStartKey = isLastSelectedItemAbsolutelyLast ? undefined : lastSelectedItem.key;
 
         existingStoreById.updateTimestamps(false);
 
@@ -166,7 +176,29 @@ export class KeyValueStoreClient extends BaseClient {
         };
     }
 
-    async getRecord(key: string, options: storage.KeyValueStoreClientGetRecordOptions = {}): Promise<storage.KeyValueStoreRecord | undefined> {
+    /**
+     * Tests whether a record with the given key exists in the key-value store without retrieving its value.
+     *
+     * @param key The queried record key.
+     * @returns `true` if the record exists, `false` if it does not.
+     */
+    async recordExists(key: string): Promise<boolean> {
+        s.string.parse(key);
+
+        // Check by id
+        const existingStoreById = await findOrCacheKeyValueStoreByPossibleId(this.client, this.name ?? this.id);
+
+        if (!existingStoreById) {
+            this.throwOnNonExisting(StorageTypes.KeyValueStore);
+        }
+
+        return existingStoreById.keyValueEntries.has(key);
+    }
+
+    async getRecord(
+        key: string,
+        options: storage.KeyValueStoreClientGetRecordOptions = {},
+    ): Promise<storage.KeyValueStoreRecord | undefined> {
         s.string.parse(key);
         s.object({
             buffer: s.boolean.optional,
@@ -183,16 +215,18 @@ export class KeyValueStoreClient extends BaseClient {
             this.throwOnNonExisting(StorageTypes.KeyValueStore);
         }
 
-        const entry = existingStoreById.keyValueEntries.get(key);
+        const storageEntry = existingStoreById.keyValueEntries.get(key);
 
-        if (!entry) {
+        if (!storageEntry) {
             return undefined;
         }
+
+        const entry = await storageEntry.get();
 
         const record: storage.KeyValueStoreRecord = {
             key: entry.key,
             value: entry.value,
-            contentType: entry.contentType ?? mime.contentType(entry.extension) as string,
+            contentType: entry.contentType ?? (mime.contentType(entry.extension) as string),
         };
 
         if (options.stream) {
@@ -211,7 +245,18 @@ export class KeyValueStoreClient extends BaseClient {
     async setRecord(record: storage.KeyValueStoreRecord): Promise<void> {
         s.object({
             key: s.string.lengthGreaterThan(0),
-            value: s.union(s.null, s.string, s.number, s.object({}).passthrough),
+            value: s.union(
+                s.null,
+                s.string,
+                s.number,
+                s.instance(Buffer),
+                s.instance(ArrayBuffer),
+                s.typedArray(),
+                // disabling validation will make shapeshift only check the object given is an actual object, not null, nor array
+                s
+                    .object({})
+                    .setValidationEnabled(false),
+            ),
             contentType: s.string.lengthGreaterThan(0).optional,
         }).parse(record);
 
@@ -256,28 +301,24 @@ export class KeyValueStoreClient extends BaseClient {
             value = Buffer.concat(chunks);
         }
 
-        const entry = {
+        const _record = {
             extension,
             key,
             value,
             contentType,
-        };
+        } satisfies InternalKeyRecord;
+
+        const entry = createKeyValueStorageImplementation({
+            persistStorage: this.client.persistStorage,
+            storeDirectory: existingStoreById.keyValueStoreDirectory,
+            writeMetadata: existingStoreById.client.writeMetadata,
+        });
+
+        await entry.update(_record);
 
         existingStoreById.keyValueEntries.set(key, entry);
 
         existingStoreById.updateTimestamps(true);
-        sendWorkerMessage({
-            action: 'update-entries',
-            data: {
-                action: 'set',
-                record: entry,
-            },
-            entityType: 'keyValueStores',
-            entityDirectory: existingStoreById.keyValueStoreDirectory,
-            id: existingStoreById.name ?? existingStoreById.id,
-            writeMetadata: this.client.writeMetadata,
-            persistStorage: this.client.persistStorage,
-        });
     }
 
     async deleteRecord(key: string): Promise<void> {
@@ -295,18 +336,7 @@ export class KeyValueStoreClient extends BaseClient {
         if (entry) {
             existingStoreById.keyValueEntries.delete(key);
             existingStoreById.updateTimestamps(true);
-            sendWorkerMessage({
-                action: 'update-entries',
-                data: {
-                    action: 'delete',
-                    record: entry,
-                },
-                entityType: 'keyValueStores',
-                entityDirectory: existingStoreById.keyValueStoreDirectory,
-                id: existingStoreById.name ?? existingStoreById.id,
-                writeMetadata: this.client.writeMetadata,
-                persistStorage: this.client.persistStorage,
-            });
+            await entry.delete();
         }
     }
 
@@ -329,7 +359,7 @@ export class KeyValueStoreClient extends BaseClient {
         }
 
         const data = this.toKeyValueStoreInfo();
-        sendWorkerMessage({
+        scheduleBackgroundTask({
             action: 'update-metadata',
             data,
             entityType: 'keyValueStores',

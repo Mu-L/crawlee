@@ -1,29 +1,32 @@
 import type {
-    BrowserRequestHandler,
     BrowserCrawlerOptions,
     BrowserCrawlingContext,
     BrowserHook,
+    BrowserRequestHandler,
+    GetUserDataFromRequest,
+    LoadedContext,
+    RouterRoutes,
 } from '@crawlee/browser';
 import { BrowserCrawler, Configuration, Router } from '@crawlee/browser';
 import type { BrowserPoolOptions, PuppeteerController, PuppeteerPlugin } from '@crawlee/browser-pool';
 import type { Dictionary } from '@crawlee/types';
 import ow from 'ow';
 import type { HTTPResponse, LaunchOptions, Page } from 'puppeteer';
+
 import type { PuppeteerLaunchContext } from './puppeteer-launcher';
 import { PuppeteerLauncher } from './puppeteer-launcher';
 import type { DirectNavigationOptions, PuppeteerContextUtils } from './utils/puppeteer_utils';
 import { gotoExtended, registerUtilsToContext } from './utils/puppeteer_utils';
 
-export interface PuppeteerCrawlingContext<UserData extends Dictionary = Dictionary> extends
-    BrowserCrawlingContext<PuppeteerCrawler, Page, HTTPResponse, PuppeteerController, UserData>, PuppeteerContextUtils {}
+export interface PuppeteerCrawlingContext<UserData extends Dictionary = Dictionary>
+    extends BrowserCrawlingContext<PuppeteerCrawler, Page, HTTPResponse, PuppeteerController, UserData>,
+        PuppeteerContextUtils {}
 export interface PuppeteerHook extends BrowserHook<PuppeteerCrawlingContext, PuppeteerGoToOptions> {}
-export interface PuppeteerRequestHandler extends BrowserRequestHandler<PuppeteerCrawlingContext> {}
+export interface PuppeteerRequestHandler extends BrowserRequestHandler<LoadedContext<PuppeteerCrawlingContext>> {}
 export type PuppeteerGoToOptions = Parameters<Page['goto']>[1];
 
-export interface PuppeteerCrawlerOptions extends BrowserCrawlerOptions<
-    PuppeteerCrawlingContext,
-    { browserPlugins: [PuppeteerPlugin] }
-> {
+export interface PuppeteerCrawlerOptions
+    extends BrowserCrawlerOptions<PuppeteerCrawlingContext, { browserPlugins: [PuppeteerPlugin] }> {
     /**
      * Options used by {@apilink launchPuppeteer} to start new Puppeteer instances.
      */
@@ -129,7 +132,11 @@ export interface PuppeteerCrawlerOptions extends BrowserCrawlerOptions<
  * ```
  * @category Crawlers
  */
-export class PuppeteerCrawler extends BrowserCrawler<{ browserPlugins: [PuppeteerPlugin] }, LaunchOptions, PuppeteerCrawlingContext> {
+export class PuppeteerCrawler extends BrowserCrawler<
+    { browserPlugins: [PuppeteerPlugin] },
+    LaunchOptions,
+    PuppeteerCrawlingContext
+> {
     protected static override optionsShape = {
         ...BrowserCrawler.optionsShape,
         browserPoolOptions: ow.optional.object,
@@ -138,52 +145,52 @@ export class PuppeteerCrawler extends BrowserCrawler<{ browserPlugins: [Puppetee
     /**
      * All `PuppeteerCrawler` parameters are passed via an options object.
      */
-    constructor(options: PuppeteerCrawlerOptions = {}, override readonly config = Configuration.getGlobalConfig()) {
+    constructor(
+        private readonly options: PuppeteerCrawlerOptions = {},
+        override readonly config = Configuration.getGlobalConfig(),
+    ) {
         ow(options, 'PuppeteerCrawlerOptions', ow.object.exactShape(PuppeteerCrawler.optionsShape));
 
-        const {
-            launchContext = {},
-            headless,
-            proxyConfiguration,
-            ...browserCrawlerOptions
-        } = options;
+        const { launchContext = {}, headless, proxyConfiguration, ...browserCrawlerOptions } = options;
 
         const browserPoolOptions = {
             ...options.browserPoolOptions,
         } as BrowserPoolOptions;
 
         if (launchContext.proxyUrl) {
-            throw new Error('PuppeteerCrawlerOptions.launchContext.proxyUrl is not allowed in PuppeteerCrawler.'
-                + 'Use PuppeteerCrawlerOptions.proxyConfiguration');
+            throw new Error(
+                'PuppeteerCrawlerOptions.launchContext.proxyUrl is not allowed in PuppeteerCrawler.' +
+                    'Use PuppeteerCrawlerOptions.proxyConfiguration',
+            );
         }
 
-        // `browserPlugins` is working when it's not overriden by `launchContext`,
-        // which for crawlers it is always overriden. Hence the error to use the other option.
+        // `browserPlugins` is working when it's not overridden by `launchContext`,
+        // which for crawlers it is always overridden. Hence the error to use the other option.
         if (browserPoolOptions.browserPlugins) {
             throw new Error('browserPoolOptions.browserPlugins is disallowed. Use launchContext.launcher instead.');
         }
 
         if (headless != null) {
             launchContext.launchOptions ??= {} as LaunchOptions;
-            launchContext.launchOptions.headless = headless;
+            launchContext.launchOptions.headless = headless as boolean;
         }
 
         const puppeteerLauncher = new PuppeteerLauncher(launchContext, config);
 
-        browserPoolOptions.browserPlugins = [
-            puppeteerLauncher.createBrowserPlugin(),
-        ];
+        browserPoolOptions.browserPlugins = [puppeteerLauncher.createBrowserPlugin()];
 
         super({ ...browserCrawlerOptions, launchContext, proxyConfiguration, browserPoolOptions }, config);
     }
 
     protected override async _runRequestHandler(context: PuppeteerCrawlingContext) {
-        registerUtilsToContext(context);
-        // eslint-disable-next-line no-underscore-dangle
+        registerUtilsToContext(context, this.options);
         await super._runRequestHandler(context);
     }
 
-    protected override async _navigationHandler(crawlingContext: PuppeteerCrawlingContext, gotoOptions: DirectNavigationOptions) {
+    protected override async _navigationHandler(
+        crawlingContext: PuppeteerCrawlingContext,
+        gotoOptions: DirectNavigationOptions,
+    ) {
         return gotoExtended(crawlingContext.page, crawlingContext.request, gotoOptions);
     }
 }
@@ -212,6 +219,9 @@ export class PuppeteerCrawler extends BrowserCrawler<{ browserPlugins: [Puppetee
  * await crawler.run();
  * ```
  */
-export function createPuppeteerRouter<Context extends PuppeteerCrawlingContext = PuppeteerCrawlingContext>() {
-    return Router.create<Context>();
+export function createPuppeteerRouter<
+    Context extends PuppeteerCrawlingContext = PuppeteerCrawlingContext,
+    UserData extends Dictionary = GetUserDataFromRequest<Context['request']>,
+>(routes?: RouterRoutes<Context, UserData>) {
+    return Router.create<Context>(routes);
 }

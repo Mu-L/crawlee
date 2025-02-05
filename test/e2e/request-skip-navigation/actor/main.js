@@ -1,6 +1,5 @@
 import { Actor } from 'apify';
 import { CheerioCrawler, Dataset, log, Request } from '@crawlee/cheerio';
-import { ApifyStorageLocal } from '@apify/storage-local';
 
 log.setLevel(log.LEVELS.DEBUG);
 
@@ -22,7 +21,10 @@ const r3 = new Request({
 
 const mainOptions = {
     exit: Actor.isAtHome(),
-    storage: process.env.STORAGE_IMPLEMENTATION === 'LOCAL' ? new ApifyStorageLocal() : undefined,
+    storage:
+        process.env.STORAGE_IMPLEMENTATION === 'LOCAL'
+            ? new (await import('@apify/storage-local')).ApifyStorageLocal()
+            : undefined,
 };
 
 // Persisting internal settings of `Request`.
@@ -31,7 +33,11 @@ await Actor.main(async () => {
     let navigationCounter = 0;
 
     const crawler = new CheerioCrawler({
-        preNavigationHooks: [() => { navigationCounter++; }],
+        preNavigationHooks: [
+            () => {
+                navigationCounter++;
+            },
+        ],
         async requestHandler({ request }) {
             requestCounter++;
             if (request.skipNavigation) {

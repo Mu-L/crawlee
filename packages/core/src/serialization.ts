@@ -1,11 +1,13 @@
-import ow from 'ow';
-import { pipeline as streamPipeline, Readable, Writable } from 'stream';
-import type Chain from 'stream-chain';
-import StreamArray from 'stream-json/streamers/StreamArray';
 import util from 'node:util';
 import zlib from 'node:zlib';
+import { pipeline as streamPipeline, Readable, Writable } from 'stream';
+
+import ow from 'ow';
+import StreamArray from 'stream-json/streamers/StreamArray';
 
 const pipeline = util.promisify(streamPipeline);
+
+type Chain = ReturnType<typeof StreamArray.withParser>;
 
 /**
  * Transforms an array of items to a JSON in a streaming
@@ -17,7 +19,10 @@ class ArrayToJson<T> extends Readable {
     private offset = 0;
     private readonly batchSize: number;
 
-    constructor(private data: T[], options: { batchSize?: number } = {}) {
+    constructor(
+        private data: T[],
+        options: { batchSize?: number } = {},
+    ) {
         super({
             ...options,
             autoDestroy: true,
@@ -61,11 +66,7 @@ class ArrayToJson<T> extends Readable {
 export async function serializeArray<T>(data: T[]): Promise<Buffer> {
     ow(data, ow.array);
     const { chunks, collector } = createChunkCollector();
-    await pipeline(
-        new ArrayToJson(data),
-        zlib.createGzip(),
-        collector,
-    );
+    await pipeline(new ArrayToJson(data), zlib.createGzip(), collector);
 
     return Buffer.concat(chunks as Buffer[]);
 }
@@ -79,15 +80,10 @@ export async function serializeArray<T>(data: T[]): Promise<Buffer> {
  * when apify-client supports streams.
  * @internal
  */
-export async function deserializeArray<T extends string | Buffer>(compressedData: Buffer): Promise<T[]> {
-    ow(compressedData, ow.buffer);
+export async function deserializeArray<T extends string | Buffer>(compressedData: Buffer | Uint8Array): Promise<T[]> {
+    ow(compressedData, ow.uint8Array);
     const { chunks, collector } = createChunkCollector<T>({ fromValuesStream: true });
-    await pipeline(
-        Readable.from([compressedData]),
-        zlib.createGunzip(),
-        StreamArray.withParser(),
-        collector,
-    );
+    await pipeline(Readable.from([compressedData]), zlib.createGunzip(), StreamArray.withParser(), collector);
 
     return chunks as T[];
 }
@@ -101,8 +97,8 @@ export async function deserializeArray<T extends string | Buffer>(compressedData
  * optimized to ingest a Stream if and when apify-client supports streams.
  * @internal
  */
-export function createDeserialize(compressedData: Buffer): Readable {
-    ow(compressedData, ow.buffer);
+export function createDeserialize(compressedData: Buffer | Uint8Array): Readable {
+    ow(compressedData, ow.uint8Array);
     const streamArray = StreamArray.withParser();
     const destination = pluckValue(streamArray);
 
@@ -117,7 +113,9 @@ export function createDeserialize(compressedData: Buffer): Readable {
     return destination;
 }
 
-function createChunkCollector<T extends string | Buffer>(options: { fromValuesStream?: boolean } = {}): { chunks: T[]; collector: Writable } {
+function createChunkCollector<T extends string | Buffer>(
+    options: { fromValuesStream?: boolean } = {},
+): { chunks: T[]; collector: Writable } {
     const { fromValuesStream = false } = options;
     const chunks: T[] = [];
     const collector = new Writable({

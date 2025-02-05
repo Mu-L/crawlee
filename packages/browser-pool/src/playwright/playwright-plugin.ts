@@ -1,26 +1,31 @@
-import os from 'os';
 import fs from 'fs';
 import net from 'net';
+import os from 'os';
 import path from 'path';
+
 import type { Browser as PlaywrightBrowser, BrowserType } from 'playwright';
+
+import { loadFirefoxAddon } from './load-firefox-addon';
 import { PlaywrightBrowser as PlaywrightBrowserWithPersistentContext } from './playwright-browser';
 import { PlaywrightController } from './playwright-controller';
 import type { BrowserController } from '../abstract-classes/browser-controller';
 import { BrowserPlugin } from '../abstract-classes/browser-plugin';
+import { anonymizeProxySugar } from '../anonymize-proxy';
+import { createProxyServerForContainers } from '../container-proxy-server';
 import type { LaunchContext } from '../launch-context';
 import { log } from '../logger';
 import { getLocalProxyAddress } from '../proxy-server';
-import { anonymizeProxySugar } from '../anonymize-proxy';
-import { createProxyServerForContainers } from '../container-proxy-server';
-import { loadFirefoxAddon } from './load-firefox-addon';
 import type { SafeParameters } from '../utils';
 
 const getFreePort = async () => {
     return new Promise<number>((resolve, reject) => {
-        const server = net.createServer().once('error', reject).listen(() => {
-            resolve((server.address() as net.AddressInfo).port);
-            server.close();
-        });
+        const server = net
+            .createServer()
+            .once('error', reject)
+            .listen(() => {
+                resolve((server.address() as net.AddressInfo).port);
+                server.close();
+            });
     });
 };
 
@@ -28,20 +33,18 @@ const getFreePort = async () => {
 //  taacPath = browser-pool/dist/tab-as-a-container
 const taacPath = path.join(__dirname, '..', 'tab-as-a-container');
 
-export class PlaywrightPlugin extends BrowserPlugin<BrowserType, SafeParameters<BrowserType['launch']>[0], PlaywrightBrowser> {
+export class PlaywrightPlugin extends BrowserPlugin<
+    BrowserType,
+    SafeParameters<BrowserType['launch']>[0],
+    PlaywrightBrowser
+> {
     private _browserVersion?: string;
     _containerProxyServer?: Awaited<ReturnType<typeof createProxyServerForContainers>>;
 
     protected async _launch(launchContext: LaunchContext<BrowserType>): Promise<PlaywrightBrowser> {
-        const {
-            launchOptions,
-            useIncognitoPages,
-            proxyUrl,
-        } = launchContext;
+        const { launchOptions, useIncognitoPages, proxyUrl } = launchContext;
 
-        let {
-            userDataDir,
-        } = launchContext;
+        let { userDataDir } = launchContext;
 
         let browser: PlaywrightBrowser;
 
@@ -50,6 +53,11 @@ export class PlaywrightPlugin extends BrowserPlugin<BrowserType, SafeParameters<
             server: await getLocalProxyAddress(),
             ...launchOptions!.proxy,
         };
+
+        // WebKit does not support --no-sandbox
+        if (this.library.name() === 'webkit') {
+            launchOptions!.args = launchOptions!.args?.filter((arg) => arg !== '--no-sandbox');
+        }
 
         const [anonymizedProxyUrl, close] = await anonymizeProxySugar(proxyUrl);
         if (anonymizedProxyUrl) {
@@ -61,7 +69,9 @@ export class PlaywrightPlugin extends BrowserPlugin<BrowserType, SafeParameters<
 
         try {
             if (useIncognitoPages) {
-                browser = await this.library.launch(launchOptions);
+                browser = await this.library.launch(launchOptions).catch((error) => {
+                    return this._throwOnFailedLaunch(launchContext, error);
+                });
 
                 if (anonymizedProxyUrl) {
                     browser.on('disconnected', async () => {
@@ -73,9 +83,7 @@ export class PlaywrightPlugin extends BrowserPlugin<BrowserType, SafeParameters<
                 let firefoxPort: number | undefined;
 
                 if (experimentalContainers) {
-                    launchOptions!.args = [
-                        ...(launchOptions!.args ?? []),
-                    ];
+                    launchOptions!.args = [...(launchOptions!.args ?? [])];
 
                     // Use native headless mode so we can load an extension
                     if (launchOptions!.headless && this.library.name() === 'chromium') {
@@ -83,7 +91,10 @@ export class PlaywrightPlugin extends BrowserPlugin<BrowserType, SafeParameters<
                     }
 
                     if (this.library.name() === 'chromium') {
-                        launchOptions!.args.push(`--disable-extensions-except=${taacPath}`, `--load-extension=${taacPath}`);
+                        launchOptions!.args.push(
+                            `--disable-extensions-except=${taacPath}`,
+                            `--load-extension=${taacPath}`,
+                        );
                     } else if (this.library.name() === 'firefox') {
                         firefoxPort = await getFreePort();
 
@@ -106,7 +117,11 @@ export class PlaywrightPlugin extends BrowserPlugin<BrowserType, SafeParameters<
                     }
                 }
 
-                const browserContext = await this.library.launchPersistentContext(userDataDir, launchOptions);
+                const browserContext = await this.library
+                    .launchPersistentContext(userDataDir, launchOptions)
+                    .catch((error) => {
+                        return this._throwOnFailedLaunch(launchContext, error);
+                    });
 
                 browserContext.once('close', () => {
                     if (userDataDir.includes('apify-playwright-firefox-taac-')) {
@@ -161,7 +176,10 @@ export class PlaywrightPlugin extends BrowserPlugin<BrowserType, SafeParameters<
                     });
                 }
 
-                browser = new PlaywrightBrowserWithPersistentContext({ browserContext, version: this._browserVersion });
+                browser = new PlaywrightBrowserWithPersistentContext({
+                    browserContext,
+                    version: this._browserVersion,
+                }) as unknown as PlaywrightBrowser;
             }
         } catch (error) {
             await close();
@@ -172,7 +190,20 @@ export class PlaywrightPlugin extends BrowserPlugin<BrowserType, SafeParameters<
         return browser;
     }
 
-    protected _createController(): BrowserController<BrowserType, SafeParameters<BrowserType['launch']>[0], PlaywrightBrowser> {
+    private _throwOnFailedLaunch(launchContext: LaunchContext<BrowserType>, cause: unknown): never {
+        this._throwAugmentedLaunchError(
+            cause,
+            launchContext.launchOptions?.executablePath,
+            '`apify/actor-node-playwright-*` (with a correct browser name)',
+            'Try installing the required dependencies by running `npx playwright install --with-deps` (https://playwright.dev/docs/browsers).',
+        );
+    }
+
+    protected _createController(): BrowserController<
+        BrowserType,
+        SafeParameters<BrowserType['launch']>[0],
+        PlaywrightBrowser
+    > {
         return new PlaywrightController(this);
     }
 

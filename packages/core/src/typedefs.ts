@@ -1,5 +1,3 @@
-/* eslint-disable @typescript-eslint/ban-types */
-
 /** @ignore */
 export type Constructor<T = unknown> = new (...args: any[]) => T;
 
@@ -16,4 +14,13 @@ export function keys<T extends {}>(obj: T) {
     return Object.keys(obj) as (keyof T)[];
 }
 
-export declare type AllowedHttpMethods = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'DELETE' | 'TRACE' | 'OPTIONS' | 'CONNECT' | 'PATCH';
+export declare type AllowedHttpMethods =
+    | 'GET'
+    | 'HEAD'
+    | 'POST'
+    | 'PUT'
+    | 'DELETE'
+    | 'TRACE'
+    | 'OPTIONS'
+    | 'CONNECT'
+    | 'PATCH';

@@ -1,18 +1,19 @@
 /* eslint-disable import/no-duplicates */
+import { rm, readdir } from 'node:fs/promises';
+import { resolve } from 'node:path';
+
 import type * as storage from '@crawlee/types';
 import type { Dictionary } from '@crawlee/types';
 import { s } from '@sapphire/shapeshift';
-import { ensureDirSync, pathExistsSync } from 'fs-extra';
-import { renameSync } from 'node:fs';
-import { rm, rename, readdir } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { ensureDirSync, move, moveSync, pathExistsSync } from 'fs-extra';
+
+import { promiseMap } from './background-handler/index';
 import { DatasetClient } from './resource-clients/dataset';
 import { DatasetCollectionClient } from './resource-clients/dataset-collection';
 import { KeyValueStoreClient } from './resource-clients/key-value-store';
 import { KeyValueStoreCollectionClient } from './resource-clients/key-value-store-collection';
 import { RequestQueueClient } from './resource-clients/request-queue';
 import { RequestQueueCollectionClient } from './resource-clients/request-queue-collection';
-import { initWorkerIfNeeded, promiseMap } from './workers/instance';
 
 export interface MemoryStorageOptions {
     /**
@@ -70,11 +71,16 @@ export class MemoryStorage implements storage.StorageClient {
         this.datasetsDirectory = resolve(this.localDataDirectory, 'datasets');
         this.keyValueStoresDirectory = resolve(this.localDataDirectory, 'key_value_stores');
         this.requestQueuesDirectory = resolve(this.localDataDirectory, 'request_queues');
-        this.writeMetadata = options.writeMetadata ?? process.env.DEBUG?.includes('*') ?? process.env.DEBUG?.includes('crawlee:memory-storage') ?? false;
-        this.persistStorage = options.persistStorage
-            ?? (process.env.CRAWLEE_PERSIST_STORAGE ? !['false', '0', ''].includes(process.env.CRAWLEE_PERSIST_STORAGE!) : true);
-
-        initWorkerIfNeeded();
+        this.writeMetadata =
+            options.writeMetadata ??
+            process.env.DEBUG?.includes('*') ??
+            process.env.DEBUG?.includes('crawlee:memory-storage') ??
+            false;
+        this.persistStorage =
+            options.persistStorage ??
+            (process.env.CRAWLEE_PERSIST_STORAGE
+                ? !['false', '0', ''].includes(process.env.CRAWLEE_PERSIST_STORAGE!)
+                : true);
     }
 
     datasets(): storage.DatasetCollectionClient {
@@ -117,7 +123,21 @@ export class MemoryStorage implements storage.StorageClient {
             timeoutSecs: s.number.optional,
         }).parse(options);
 
-        return new RequestQueueClient({ id, baseStorageDirectory: this.requestQueuesDirectory, client: this, ...options });
+        return new RequestQueueClient({
+            id,
+            baseStorageDirectory: this.requestQueuesDirectory,
+            client: this,
+            ...options,
+        });
+    }
+
+    async setStatusMessage(message: string, options: storage.SetStatusMessageOptions = {}): Promise<void> {
+        s.string.parse(message);
+        s.object({
+            isStatusMessageTerminal: s.boolean.optional,
+        }).parse(options);
+
+        return Promise.resolve();
     }
 
     /**
@@ -133,9 +153,13 @@ export class MemoryStorage implements storage.StorageClient {
 
         for (const keyValueStoreFolder of keyValueStores) {
             if (keyValueStoreFolder.startsWith('__CRAWLEE_TEMPORARY') || keyValueStoreFolder.startsWith('__OLD')) {
-                keyValueStorePromises.push((await this.batchRemoveFiles(resolve(this.keyValueStoresDirectory, keyValueStoreFolder)))());
+                keyValueStorePromises.push(
+                    (await this.batchRemoveFiles(resolve(this.keyValueStoresDirectory, keyValueStoreFolder)))(),
+                );
             } else if (keyValueStoreFolder === 'default') {
-                keyValueStorePromises.push(this.handleDefaultKeyValueStore(resolve(this.keyValueStoresDirectory, keyValueStoreFolder))());
+                keyValueStorePromises.push(
+                    this.handleDefaultKeyValueStore(resolve(this.keyValueStoresDirectory, keyValueStoreFolder))(),
+                );
             }
         }
 
@@ -159,7 +183,9 @@ export class MemoryStorage implements storage.StorageClient {
 
         for (const requestQueueFolder of requestQueues) {
             if (requestQueueFolder === 'default' || requestQueueFolder.startsWith('__CRAWLEE_TEMPORARY')) {
-                requestQueuePromises.push((await this.batchRemoveFiles(resolve(this.requestQueuesDirectory, requestQueueFolder)))());
+                requestQueuePromises.push(
+                    (await this.batchRemoveFiles(resolve(this.requestQueuesDirectory, requestQueueFolder)))(),
+                );
             }
         }
 
@@ -170,7 +196,7 @@ export class MemoryStorage implements storage.StorageClient {
      * This method should be called at the end of the process, to ensure all data is saved.
      */
     async teardown(): Promise<void> {
-        const promises = [...promiseMap.values()].map(({ promise }) => promise);
+        const promises = [...promiseMap.values()].map(async ({ promise }) => promise);
 
         await Promise.all(promises);
     }
@@ -180,12 +206,7 @@ export class MemoryStorage implements storage.StorageClient {
         const temporaryPath = resolve(folder, '../__CRAWLEE_MIGRATING_KEY_VALUE_STORE__');
 
         // For optimization, we want to only attempt to copy a few files from the default key-value store
-        const possibleInputKeys = [
-            'INPUT',
-            'INPUT.json',
-            'INPUT.bin',
-            'INPUT.txt',
-        ];
+        const possibleInputKeys = ['INPUT', 'INPUT.json', 'INPUT.bin', 'INPUT.txt'];
 
         if (storagePathExists) {
             // Create temporary folder to save important files in
@@ -197,7 +218,7 @@ export class MemoryStorage implements storage.StorageClient {
                 const tempFilePath = resolve(temporaryPath, entity);
 
                 try {
-                    renameSync(originalFilePath, tempFilePath);
+                    moveSync(originalFilePath, tempFilePath);
                 } catch {
                     // Ignore
                 }
@@ -210,7 +231,7 @@ export class MemoryStorage implements storage.StorageClient {
 
             while (!done) {
                 try {
-                    renameSync(folder, tempPathForOldFolder);
+                    moveSync(folder, tempPathForOldFolder);
                     done = true;
                 } catch {
                     tempPathForOldFolder = resolve(folder, `../__OLD_DEFAULT_${++counter}__`);
@@ -218,24 +239,24 @@ export class MemoryStorage implements storage.StorageClient {
             }
 
             // Replace the temporary folder with the original folder
-            renameSync(temporaryPath, folder);
+            moveSync(temporaryPath, folder);
 
             // Remove the old folder
             return async () => (await this.batchRemoveFiles(tempPathForOldFolder))();
         }
 
-        return () => Promise.resolve();
+        return async () => Promise.resolve();
     }
 
     private async batchRemoveFiles(folder: string, counter = 0): Promise<() => Promise<void>> {
         const folderExists = pathExistsSync(folder);
 
         if (folderExists) {
-            const temporaryFolder = folder.startsWith('__CRAWLEE_TEMPORARY_') ? folder : resolve(folder, `../__CRAWLEE_TEMPORARY_${counter}__`);
+            const temporaryFolder = resolve(folder, `../__CRAWLEE_TEMPORARY_${counter}__`);
 
             try {
                 // Rename the old folder to the new one to allow background deletions
-                await rename(folder, temporaryFolder);
+                await move(folder, temporaryFolder);
             } catch {
                 // Folder exists already, try again with an incremented counter
                 return this.batchRemoveFiles(folder, ++counter);
@@ -267,6 +288,6 @@ export class MemoryStorage implements storage.StorageClient {
             };
         }
 
-        return () => Promise.resolve();
+        return async () => Promise.resolve();
     }
 }

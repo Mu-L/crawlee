@@ -1,10 +1,9 @@
-/* eslint-disable no-underscore-dangle */
+import os from 'os';
 
 import log from '@apify/log';
 import { Configuration, EventType, LocalEventManager, Snapshotter } from '@crawlee/core';
 import type { MemoryInfo } from '@crawlee/utils';
 import { sleep } from '@crawlee/utils';
-import os from 'os';
 
 const toBytes = (x: number) => x * 1024 * 1024;
 
@@ -23,8 +22,8 @@ describe('Snapshotter', () => {
         // mock client data
         const apifyClient = Configuration.getStorageClient();
         const oldStats = apifyClient.stats;
-        apifyClient.stats = {} as never;
-        apifyClient.stats.rateLimitErrors = [0, 0, 0];
+        apifyClient.stats = {} as any;
+        apifyClient.stats!.rateLimitErrors = [0, 0, 0];
 
         const config = new Configuration({ systemInfoIntervalMillis: 100 });
         const snapshotter = new Snapshotter({ config });
@@ -33,7 +32,7 @@ describe('Snapshotter', () => {
         await snapshotter.start();
 
         await sleep(625);
-        apifyClient.stats.rateLimitErrors = [0, 0, 2];
+        apifyClient.stats!.rateLimitErrors = [0, 0, 2];
         await sleep(625);
 
         await snapshotter.stop();
@@ -125,13 +124,15 @@ describe('Snapshotter', () => {
     });
 
     test('correctly marks CPU overloaded using OS metrics', async () => {
-        const cpusMock = jest.spyOn(os, 'cpus');
-        const fakeCpu = [{
-            times: {
-                idle: 0,
-                other: 0,
+        const cpusMock = vitest.spyOn(os, 'cpus');
+        const fakeCpu = [
+            {
+                times: {
+                    idle: 0,
+                    other: 0,
+                },
             },
-        }];
+        ];
         const { times } = fakeCpu[0];
 
         cpusMock.mockReturnValue(fakeCpu as any);
@@ -140,7 +141,7 @@ describe('Snapshotter', () => {
         const config = new Configuration({ maxUsedCpuRatio: 0.5 });
         const snapshotter = new Snapshotter({ config });
         // do not initialize the event intervals as we will fire them manually
-        const spy = jest.spyOn(LocalEventManager.prototype, 'init').mockImplementation();
+        const spy = vitest.spyOn(LocalEventManager.prototype, 'init').mockImplementation(async () => {});
         const events = config.getEventManager() as LocalEventManager;
         await snapshotter.start();
 
@@ -169,13 +170,11 @@ describe('Snapshotter', () => {
         expect(loopSnapshots[4].isOverloaded).toBe(true);
         expect(cpusMock).toBeCalledTimes(5);
 
-        cpusMock.mockRestore();
-        spy.mockRestore();
         await snapshotter.stop();
     });
 
     test('correctly marks eventLoopOverloaded', () => {
-        const clock = jest.useFakeTimers();
+        const clock = vitest.useFakeTimers();
         try {
             const noop = () => {};
             const snapshotter = new Snapshotter({ maxBlockedMillis: 5, eventLoopSnapshotIntervalSecs: 0 });
@@ -202,7 +201,7 @@ describe('Snapshotter', () => {
             expect(loopSnapshots[3].isOverloaded).toBe(true);
             expect(loopSnapshots[4].isOverloaded).toBe(false);
         } finally {
-            jest.useRealTimers();
+            vitest.useRealTimers();
         }
     });
 
@@ -213,13 +212,15 @@ describe('Snapshotter', () => {
             childProcessesBytes: toBytes(1000),
         } as MemoryInfo;
         const getMemoryInfo = async () => ({ ...memoryData });
-        jest.spyOn(LocalEventManager.prototype as any, '_getMemoryInfo').mockImplementation(getMemoryInfo);
-        jest.spyOn(Snapshotter.prototype as any, '_getMemoryInfo').mockResolvedValueOnce({ totalBytes: toBytes(10000) });
+        vitest.spyOn(LocalEventManager.prototype as any, '_getMemoryInfo').mockImplementation(getMemoryInfo);
+        vitest
+            .spyOn(Snapshotter.prototype as any, '_getMemoryInfo')
+            .mockResolvedValueOnce({ totalBytes: toBytes(10000) });
 
         const config = new Configuration({ availableMemoryRatio: 1 });
         const snapshotter = new Snapshotter({ config, maxUsedMemoryRatio: 0.5 });
         // do not initialize the event intervals as we will fire them manually
-        jest.spyOn(LocalEventManager.prototype, 'init').mockImplementation();
+        vitest.spyOn(LocalEventManager.prototype, 'init').mockImplementation(async () => {});
         const events = config.getEventManager() as LocalEventManager;
         await snapshotter.start();
 
@@ -242,15 +243,17 @@ describe('Snapshotter', () => {
         expect(memorySnapshots[4].isOverloaded).toBe(false);
 
         await snapshotter.stop();
-        jest.restoreAllMocks();
+        vitest.restoreAllMocks();
     });
 
     test('correctly logs critical memory overload', async () => {
-        jest.spyOn(Snapshotter.prototype as any, '_getMemoryInfo').mockResolvedValueOnce({ totalBytes: toBytes(10000) });
+        vitest
+            .spyOn(Snapshotter.prototype as any, '_getMemoryInfo')
+            .mockResolvedValueOnce({ totalBytes: toBytes(10000) });
         const config = new Configuration({ availableMemoryRatio: 1 });
         const snapshotter = new Snapshotter({ config, maxUsedMemoryRatio: 0.5 });
         await snapshotter.start();
-        const warningSpy = jest.spyOn(snapshotter.log, 'warning').mockImplementation();
+        const warningSpy = vitest.spyOn(snapshotter.log, 'warning').mockImplementation(() => {});
 
         // @ts-expect-error Calling private method
         snapshotter._memoryOverloadWarning({
@@ -265,7 +268,7 @@ describe('Snapshotter', () => {
         });
         expect(warningSpy).not.toBeCalled();
 
-        jest.restoreAllMocks();
+        vitest.restoreAllMocks();
         await snapshotter.stop();
     });
 
@@ -274,19 +277,19 @@ describe('Snapshotter', () => {
         // mock client data
         const apifyClient = Configuration.getStorageClient();
         const oldStats = apifyClient.stats;
-        apifyClient.stats = {} as never;
-        apifyClient.stats.rateLimitErrors = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        apifyClient.stats = {} as any;
+        apifyClient.stats!.rateLimitErrors = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
         const snapshotter = new Snapshotter({ maxClientErrors: 1 });
         // @ts-expect-error Calling protected method
         snapshotter._snapshotClient(noop);
-        apifyClient.stats.rateLimitErrors = [1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+        apifyClient.stats!.rateLimitErrors = [1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
         // @ts-expect-error Calling protected method
         snapshotter._snapshotClient(noop);
-        apifyClient.stats.rateLimitErrors = [10, 5, 2, 0, 0, 0, 0, 0, 0, 0];
+        apifyClient.stats!.rateLimitErrors = [10, 5, 2, 0, 0, 0, 0, 0, 0, 0];
         // @ts-expect-error Calling protected method
         snapshotter._snapshotClient(noop);
-        apifyClient.stats.rateLimitErrors = [100, 24, 4, 2, 0, 0, 0, 0, 0, 0];
+        apifyClient.stats!.rateLimitErrors = [100, 24, 4, 2, 0, 0, 0, 0, 0, 0];
         // @ts-expect-error Calling protected method
         snapshotter._snapshotClient(noop);
 
@@ -325,9 +328,11 @@ describe('Snapshotter', () => {
             const snapshot = eventLoopSnapshots[eventLoopSnapshots.length - 1 - i];
             expect(sample).toEqual(snapshot);
         }
-        const diffBetween = eventLoopSample[eventLoopSample.length - 1].createdAt.getTime()
-            - eventLoopSnapshots[eventLoopSnapshots.length - 1].createdAt.getTime();
-        const diffWithin = eventLoopSample[0].createdAt.getTime() - eventLoopSample[eventLoopSample.length - 1].createdAt.getTime();
+        const diffBetween =
+            eventLoopSample[eventLoopSample.length - 1].createdAt.getTime() -
+            eventLoopSnapshots[eventLoopSnapshots.length - 1].createdAt.getTime();
+        const diffWithin =
+            eventLoopSample[0].createdAt.getTime() - eventLoopSample[eventLoopSample.length - 1].createdAt.getTime();
         expect(diffBetween).toBeLessThan(SAMPLE_SIZE_MILLIS);
         expect(diffWithin).toBeLessThan(SAMPLE_SIZE_MILLIS);
     });

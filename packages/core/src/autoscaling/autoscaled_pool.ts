@@ -3,12 +3,14 @@ import { addTimeoutToPromise } from '@apify/timeout';
 import type { BetterIntervalID } from '@apify/utilities';
 import { betterClearInterval, betterSetInterval } from '@apify/utilities';
 import ow from 'ow';
-import { Configuration } from '../configuration';
-import { log as defaultLog } from '../log';
+
 import type { SnapshotterOptions } from './snapshotter';
 import { Snapshotter } from './snapshotter';
 import type { SystemInfo, SystemStatusOptions } from './system_status';
 import { SystemStatus } from './system_status';
+import { Configuration } from '../configuration';
+import { CriticalError } from '../errors';
+import { log as defaultLog } from '../log';
 
 export interface AutoscaledPoolOptions {
     /**
@@ -201,7 +203,6 @@ export class AutoscaledPool {
     private reject: ((reason?: unknown) => void) | null = null;
     private snapshotter: Snapshotter;
     private systemStatus: SystemStatus;
-    private poolPromise!: Promise<unknown>;
     private autoscaleInterval!: BetterIntervalID;
     private maybeRunInterval!: BetterIntervalID;
     private queryingIsTaskReady!: boolean;
@@ -213,25 +214,28 @@ export class AutoscaledPool {
         options: AutoscaledPoolOptions,
         private readonly config = Configuration.getGlobalConfig(),
     ) {
-        ow(options, ow.object.exactShape({
-            runTaskFunction: ow.function,
-            isFinishedFunction: ow.function,
-            isTaskReadyFunction: ow.function,
-            maxConcurrency: ow.optional.number.integer.greaterThanOrEqual(1),
-            minConcurrency: ow.optional.number.integer.greaterThanOrEqual(1),
-            desiredConcurrency: ow.optional.number.integer.greaterThanOrEqual(1),
-            desiredConcurrencyRatio: ow.optional.number.greaterThan(0).lessThan(1),
-            scaleUpStepRatio: ow.optional.number.greaterThan(0).lessThan(1),
-            scaleDownStepRatio: ow.optional.number.greaterThan(0).lessThan(1),
-            maybeRunIntervalSecs: ow.optional.number.greaterThan(0),
-            loggingIntervalSecs: ow.any(ow.number.greaterThan(0), ow.nullOrUndefined),
-            autoscaleIntervalSecs: ow.optional.number.greaterThan(0),
-            taskTimeoutSecs: ow.optional.number.greaterThanOrEqual(0),
-            systemStatusOptions: ow.optional.object,
-            snapshotterOptions: ow.optional.object,
-            log: ow.optional.object,
-            maxTasksPerMinute: ow.optional.number.integerOrInfinite.greaterThanOrEqual(1),
-        }));
+        ow(
+            options,
+            ow.object.exactShape({
+                runTaskFunction: ow.function,
+                isFinishedFunction: ow.function,
+                isTaskReadyFunction: ow.function,
+                maxConcurrency: ow.optional.number.integer.greaterThanOrEqual(1),
+                minConcurrency: ow.optional.number.integer.greaterThanOrEqual(1),
+                desiredConcurrency: ow.optional.number.integer.greaterThanOrEqual(1),
+                desiredConcurrencyRatio: ow.optional.number.greaterThan(0).lessThan(1),
+                scaleUpStepRatio: ow.optional.number.greaterThan(0).lessThan(1),
+                scaleDownStepRatio: ow.optional.number.greaterThan(0).lessThan(1),
+                maybeRunIntervalSecs: ow.optional.number.greaterThan(0),
+                loggingIntervalSecs: ow.any(ow.number.greaterThan(0), ow.nullOrUndefined),
+                autoscaleIntervalSecs: ow.optional.number.greaterThan(0),
+                taskTimeoutSecs: ow.optional.number.greaterThanOrEqual(0),
+                systemStatusOptions: ow.optional.object,
+                snapshotterOptions: ow.optional.object,
+                log: ow.optional.object,
+                maxTasksPerMinute: ow.optional.number.integerOrInfinite.greaterThanOrEqual(1),
+            }),
+        );
 
         const {
             runTaskFunction,
@@ -240,7 +244,7 @@ export class AutoscaledPool {
             maxConcurrency = 200,
             minConcurrency = 1,
             desiredConcurrency,
-            desiredConcurrencyRatio = 0.90,
+            desiredConcurrencyRatio = 0.9,
             scaleUpStepRatio = 0.05,
             scaleDownStepRatio = 0.05,
             maybeRunIntervalSecs = 0.5,
@@ -344,7 +348,7 @@ export class AutoscaledPool {
     }
 
     /**
-     * Gets the the number of parallel tasks currently running in the pool.
+     * Gets the number of parallel tasks currently running in the pool.
      */
     get currentConcurrency(): number {
         return this._currentConcurrency;
@@ -355,7 +359,7 @@ export class AutoscaledPool {
      * all the tasks are finished or one of them fails.
      */
     async run(): Promise<void> {
-        this.poolPromise = new Promise((resolve, reject) => {
+        const poolPromise = new Promise((resolve, reject) => {
             this.resolve = resolve;
             this.reject = reject;
         });
@@ -376,7 +380,7 @@ export class AutoscaledPool {
         }
 
         try {
-            await this.poolPromise;
+            await poolPromise;
         } finally {
             // If resolve is null, the pool is already destroyed.
             if (this.resolve) await this._destroy();
@@ -420,8 +424,10 @@ export class AutoscaledPool {
             let timeout: NodeJS.Timeout;
             if (timeoutSecs) {
                 timeout = setTimeout(() => {
-                    const err = new Error('The pool\'s running tasks did not finish'
-                        + `in ${timeoutSecs} secs after pool.pause() invocation.`);
+                    const err = new Error(
+                        "The pool's running tasks did not finish" +
+                            `in ${timeoutSecs} secs after pool.pause() invocation.`,
+                    );
                     reject(err);
                 }, timeoutSecs);
             }
@@ -445,6 +451,14 @@ export class AutoscaledPool {
      */
     resume(): void {
         this.isStopped = false;
+    }
+
+    /**
+     * Explicitly check the queue for new tasks. The AutoscaledPool checks the queue for new tasks periodically,
+     * every `maybeRunIntervalSecs` seconds. If you want to trigger the processing immediately, use this method.
+     */
+    async notify(): Promise<void> {
+        setImmediate(this._maybeRunTask);
     }
 
     /**
@@ -532,7 +546,7 @@ export class AutoscaledPool {
 
             if (this.taskTimeoutMillis > 0) {
                 await addTimeoutToPromise(
-                    () => this.runTaskFunction(),
+                    async () => this.runTaskFunction(),
                     this.taskTimeoutMillis,
                     `runTaskFunction timed out after ${this.taskTimeoutMillis / 1000} seconds.`,
                 );
@@ -550,7 +564,12 @@ export class AutoscaledPool {
             // We might have already rejected this promise.
             if (this.reject) {
                 // No need to log all concurrent errors.
-                this.log.exception(err, 'runTaskFunction failed.');
+                if (
+                    // avoid reprinting the same critical error multiple times, as it will be printed by Nodejs at the end anyway
+                    !(e instanceof CriticalError)
+                ) {
+                    this.log.exception(err, 'runTaskFunction failed.');
+                }
                 this.reject(err);
             }
         }

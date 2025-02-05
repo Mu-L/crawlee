@@ -1,25 +1,20 @@
-import os from 'os';
-import express from 'express';
-import playwright from 'playwright';
-import log from '@apify/log';
-import type {
-    PlaywrightGotoOptions,
-    PlaywrightRequestHandler,
-    Request,
-} from '@crawlee/playwright';
-import {
-    PlaywrightCrawler,
-    RequestList,
-} from '@crawlee/playwright';
 import type { Server } from 'http';
 import type { AddressInfo } from 'net';
+import os from 'os';
+
+import log from '@apify/log';
+import type { PlaywrightGotoOptions, PlaywrightRequestHandler, Request } from '@crawlee/playwright';
+import { PlaywrightCrawler, RequestList } from '@crawlee/playwright';
+import express from 'express';
+import playwright from 'playwright';
 import { MemoryStorageEmulator } from 'test/shared/MemoryStorageEmulator';
+
 import { startExpressAppPromise } from '../../shared/_helper';
 
-if (os.platform() === 'win32') jest.setTimeout(2 * 60 * 1e3);
+if (os.platform() === 'win32') vitest.setConfig({ testTimeout: 2 * 60 * 1e3 });
 
 describe('PlaywrightCrawler', () => {
-    let prevEnvHeadless: string;
+    let prevEnvHeadless: string | undefined;
     let logLevel: number;
     const localStorageEmulator = new MemoryStorageEmulator();
     let requestList: RequestList;
@@ -64,7 +59,7 @@ describe('PlaywrightCrawler', () => {
         server.close();
     });
 
-    jest.setTimeout(2 * 60 * 1e3);
+    vitest.setConfig({ testTimeout: 2 * 60 * 1e3 });
     describe('should work', () => {
         // @TODO: add webkit
         test.each(['chromium', 'firefox'] as const)('with %s', async (browser) => {
@@ -80,12 +75,23 @@ describe('PlaywrightCrawler', () => {
             const processed: Request[] = [];
             const failed: Request[] = [];
             const requestListLarge = await RequestList.open({ sources: sourcesLarge });
-            const requestHandler = async ({ page, request, response }: Parameters<PlaywrightRequestHandler>[0]) => {
-                expect(response.status()).toBe(200);
+            const requestHandler = async ({
+                page,
+                request,
+                response,
+                useState,
+            }: Parameters<PlaywrightRequestHandler>[0]) => {
+                const state = await useState([]);
+                expect(response!.status()).toBe(200);
                 request.userData.title = await page.title();
                 processed.push(request);
-                expect(response.request().headers()['user-agent']).not.toMatch(/headless/i);
-                await expect(page.evaluate(() => window.navigator.webdriver)).resolves.toBeFalsy();
+                expect(response!.request().headers()['user-agent']).not.toMatch(/headless/i);
+
+                // firefox now also returns `webdriver: true` since playwright 1.45, we are masking this via fingerprints,
+                // but this test has them disabled, so we can check the default handling (= there is non-default UA even without them)
+                if (browser !== 'firefox') {
+                    await expect(page.evaluate(() => window.navigator.webdriver)).resolves.toBeFalsy();
+                }
             };
 
             const playwrightCrawler = new PlaywrightCrawler({
@@ -104,7 +110,7 @@ describe('PlaywrightCrawler', () => {
 
             await playwrightCrawler.run();
 
-            expect(playwrightCrawler.autoscaledPool.minConcurrency).toBe(1);
+            expect(playwrightCrawler.autoscaledPool!.minConcurrency).toBe(1);
             expect(processed).toHaveLength(6);
             expect(failed).toHaveLength(0);
 
@@ -122,16 +128,17 @@ describe('PlaywrightCrawler', () => {
             requestList,
             maxRequestRetries: 0,
             maxConcurrency: 1,
-            requestHandler: () => {
-            },
-            preNavigationHooks: [(_context, gotoOptions) => {
-                options = gotoOptions;
-            }],
+            requestHandler: () => {},
+            preNavigationHooks: [
+                (_context, gotoOptions) => {
+                    options = gotoOptions;
+                },
+            ],
             navigationTimeoutSecs: timeoutSecs,
         });
 
         await playwrightCrawler.run();
-        expect(options.timeout).toEqual(timeoutSecs * 1000);
+        expect(options!.timeout).toEqual(timeoutSecs * 1000);
     });
 
     test('shallow clones browserPoolOptions before normalization', () => {

@@ -1,10 +1,12 @@
+import { resolve } from 'path';
+
 import type * as storage from '@crawlee/types';
 import { s } from '@sapphire/shapeshift';
-import { resolve } from 'path';
+
+import { DatasetClient } from './dataset';
+import { scheduleBackgroundTask } from '../background-handler';
 import { findOrCacheDatasetByPossibleId } from '../cache-helpers';
 import type { MemoryStorage } from '../index';
-import { sendWorkerMessage } from '../workers/instance';
-import { DatasetClient } from './dataset';
 
 export interface DatasetCollectionClientOptions {
     baseStorageDirectory: string;
@@ -27,8 +29,8 @@ export class DatasetCollectionClient implements storage.DatasetCollectionClient 
             offset: 0,
             limit: this.client.datasetClientsHandled.length,
             desc: false,
-            items: this.client.datasetClientsHandled.map(
-                (store) => store.toDatasetInfo())
+            items: this.client.datasetClientsHandled
+                .map((store) => store.toDatasetInfo())
                 .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()),
         };
     }
@@ -49,8 +51,8 @@ export class DatasetCollectionClient implements storage.DatasetCollectionClient 
 
         // Schedule the worker to write to the disk
         const datasetInfo = newStore.toDatasetInfo();
-        // eslint-disable-next-line dot-notation
-        sendWorkerMessage({
+
+        scheduleBackgroundTask({
             action: 'update-metadata',
             entityType: 'datasets',
             entityDirectory: newStore.datasetDirectory,

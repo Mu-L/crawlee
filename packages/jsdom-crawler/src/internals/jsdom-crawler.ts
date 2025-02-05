@@ -1,36 +1,48 @@
-import ow from 'ow';
+import type { IncomingMessage } from 'http';
+
+import { addTimeoutToPromise } from '@apify/timeout';
+import { concatStreamToBuffer } from '@apify/utilities';
 import type {
+    EnqueueLinksOptions,
+    ErrorHandler,
+    GetUserDataFromRequest,
     HttpCrawlerOptions,
     InternalHttpCrawlingContext,
     InternalHttpHook,
-    ErrorHandler,
     RequestHandler,
-    EnqueueLinksOptions,
-    RequestQueue,
+    RouterRoutes,
     Configuration,
+    RequestProvider,
 } from '@crawlee/http';
-import { HttpCrawler, enqueueLinks, Router, resolveBaseUrlForEnqueueLinksFiltering } from '@crawlee/http';
-import type { BatchAddRequestsResult, Dictionary } from '@crawlee/types';
-import { concatStreamToBuffer } from '@apify/utilities';
+import {
+    HttpCrawler,
+    enqueueLinks,
+    Router,
+    resolveBaseUrlForEnqueueLinksFiltering,
+    tryAbsoluteURL,
+} from '@crawlee/http';
+import type { Dictionary } from '@crawlee/types';
+import { type CheerioRoot, sleep } from '@crawlee/utils';
+import * as cheerio from 'cheerio';
 import type { DOMWindow } from 'jsdom';
 import { JSDOM, ResourceLoader, VirtualConsole } from 'jsdom';
-import type { IncomingMessage } from 'http';
+import ow from 'ow';
 
 export type JSDOMErrorHandler<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     JSONData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
-    > = ErrorHandler<JSDOMCrawlingContext<UserData, JSONData>>;
+> = ErrorHandler<JSDOMCrawlingContext<UserData, JSONData>>;
 
 export interface JSDOMCrawlerOptions<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     JSONData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
-    > extends HttpCrawlerOptions<JSDOMCrawlingContext<UserData, JSONData>> {
+> extends HttpCrawlerOptions<JSDOMCrawlingContext<UserData, JSONData>> {
     /**
      * Download and run scripts.
      */
     runScripts?: boolean;
     /**
-     * Supress the logs from JSDOM internal console.
+     * Suppress the logs from JSDOM internal console.
      */
     hideInternalConsole?: boolean;
 }
@@ -38,21 +50,49 @@ export interface JSDOMCrawlerOptions<
 export type JSDOMHook<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     JSONData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
-    > = InternalHttpHook<JSDOMCrawlingContext<UserData, JSONData>>;
+> = InternalHttpHook<JSDOMCrawlingContext<UserData, JSONData>>;
 
 export interface JSDOMCrawlingContext<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     JSONData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
-    > extends InternalHttpCrawlingContext<UserData, JSONData, JSDOMCrawler> {
+> extends InternalHttpCrawlingContext<UserData, JSONData, JSDOMCrawler> {
     window: DOMWindow;
+    document: Document;
 
-    enqueueLinks: (options?: EnqueueLinksOptions) => Promise<BatchAddRequestsResult>;
+    /**
+     * Wait for an element matching the selector to appear.
+     * Timeout defaults to 5s.
+     *
+     * **Example usage:**
+     * ```ts
+     * async requestHandler({ waitForSelector, parseWithCheerio }) {
+     *     await waitForSelector('article h1');
+     *     const $ = await parseWithCheerio();
+     *     const title = $('title').text();
+     * });
+     * ```
+     */
+    waitForSelector(selector: string, timeoutMs?: number): Promise<void>;
+
+    /**
+     * Returns Cheerio handle, allowing to work with the data same way as with {@apilink CheerioCrawler}.
+     * When provided with the `selector` argument, it will first look for the selector with a 5s timeout.
+     *
+     * **Example usage:**
+     * ```javascript
+     * async requestHandler({ parseWithCheerio }) {
+     *     const $ = await parseWithCheerio();
+     *     const title = $('title').text();
+     * });
+     * ```
+     */
+    parseWithCheerio(selector?: string, timeoutMs?: number): Promise<CheerioRoot>;
 }
 
 export type JSDOMRequestHandler<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     JSONData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
-    > = RequestHandler<JSDOMCrawlingContext<UserData, JSONData>>;
+> = RequestHandler<JSDOMCrawlingContext<UserData, JSONData>>;
 
 /**
  * Provides a framework for the parallel crawling of web pages using plain HTTP requests and
@@ -130,7 +170,8 @@ export type JSDOMRequestHandler<
 const resources = new ResourceLoader({
     // Copy from /packages/browser-pool/src/abstract-classes/browser-plugin.ts:17
     // in order not to include the entire package here
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36',
+    userAgent:
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36',
 });
 
 export class JSDOMCrawler extends HttpCrawler<JSDOMCrawlingContext> {
@@ -145,11 +186,7 @@ export class JSDOMCrawler extends HttpCrawler<JSDOMCrawlingContext> {
     protected virtualConsole: VirtualConsole | null = null;
 
     constructor(options: JSDOMCrawlerOptions = {}, config?: Configuration) {
-        const {
-            runScripts = false,
-            hideInternalConsole = false,
-            ...httpOptions
-        } = options;
+        const { runScripts = false, hideInternalConsole = false, ...httpOptions } = options;
 
         super(httpOptions, config);
 
@@ -172,20 +209,33 @@ export class JSDOMCrawler extends HttpCrawler<JSDOMCrawlingContext> {
      * ```
      */
     getVirtualConsole() {
-        if (!this.virtualConsole) {
-            this.virtualConsole = new VirtualConsole();
-            if (!this.hideInternalConsole) {
-                this.virtualConsole.sendTo(console);
-            }
+        if (this.virtualConsole) {
+            return this.virtualConsole;
         }
+
+        this.virtualConsole = new VirtualConsole();
+
+        if (!this.hideInternalConsole) {
+            this.virtualConsole.sendTo(console, { omitJSDOMErrors: true });
+        }
+
+        this.virtualConsole.on('jsdomError', this.jsdomErrorHandler);
+
         return this.virtualConsole;
     }
 
+    private readonly jsdomErrorHandler = (error: Error) => this.log.debug('JSDOM error from console', error);
+
     protected override async _cleanupContext(context: JSDOMCrawlingContext) {
+        this.getVirtualConsole().off('jsdomError', this.jsdomErrorHandler);
         context.window?.close();
     }
 
-    protected override async _parseHTML(response: IncomingMessage, isXml: boolean, crawlingContext: JSDOMCrawlingContext) {
+    protected override async _parseHTML(
+        response: IncomingMessage,
+        isXml: boolean,
+        crawlingContext: JSDOMCrawlingContext,
+    ) {
         const body = await concatStreamToBuffer(response);
 
         const { window } = new JSDOM(body, {
@@ -194,20 +244,59 @@ export class JSDOMCrawler extends HttpCrawler<JSDOMCrawlingContext> {
             runScripts: this.runScripts ? 'dangerously' : undefined,
             resources,
             virtualConsole: this.getVirtualConsole(),
+            pretendToBeVisual: true,
         });
 
+        // add some stubs in place of missing API so processing won't fail
+        Object.defineProperty(window, 'matchMedia', {
+            writable: true,
+            value: (query: unknown): any => ({
+                matches: false,
+                media: query,
+                onchange: null,
+                addListener: () => {},
+                removeListener: () => {},
+                addEventListener: () => {},
+                removeEventListener: () => {},
+                dispatchEvent: () => {},
+            }),
+        });
+        window.document.createRange = () => {
+            const range = new window.Range();
+            range.getBoundingClientRect = () => ({}) as any;
+            range.getClientRects = () => ({ item: () => null as any, length: 0 }) as any;
+            return range;
+        };
+
         if (this.runScripts) {
-            await new Promise<void>((resolve) => {
-                window.addEventListener('load', () => {
-                    resolve();
-                });
-            });
+            try {
+                await addTimeoutToPromise(
+                    async () => {
+                        return new Promise<void>((resolve) => {
+                            window.addEventListener(
+                                'load',
+                                () => {
+                                    resolve();
+                                },
+                                false,
+                            );
+                        }).catch();
+                    },
+                    10_000,
+                    'Window.load event not fired after 10 seconds.',
+                ).catch();
+            } catch (e) {
+                this.log.debug((e as Error).message);
+            }
         }
 
         return {
             window,
             get body() {
                 return window.document.documentElement.outerHTML;
+            },
+            get document() {
+                return window.document;
             },
             enqueueLinks: async (enqueueOptions?: EnqueueLinksOptions) => {
                 return domCrawlerEnqueueLinks({
@@ -220,18 +309,50 @@ export class JSDOMCrawler extends HttpCrawler<JSDOMCrawlingContext> {
             },
         };
     }
+
+    override async _runRequestHandler(context: JSDOMCrawlingContext) {
+        context.waitForSelector = async (selector: string, timeoutMs = 5_000) => {
+            const $ = cheerio.load(context.body);
+
+            if ($(selector).get().length === 0) {
+                if (timeoutMs) {
+                    await sleep(50);
+                    return context.waitForSelector(selector, Math.max(timeoutMs - 50, 0));
+                }
+
+                throw new Error(`Selector '${selector}' not found.`);
+            }
+        };
+        context.parseWithCheerio = async (selector?: string, _timeoutMs = 5_000) => {
+            const $ = cheerio.load(context.body);
+
+            if (selector && $(selector).get().length === 0) {
+                throw new Error(`Selector '${selector}' not found.`);
+            }
+
+            return $;
+        };
+
+        await super._runRequestHandler(context);
+    }
 }
 
 interface EnqueueLinksInternalOptions {
     options?: EnqueueLinksOptions;
     window: DOMWindow | null;
-    requestQueue: RequestQueue;
+    requestQueue: RequestProvider;
     originalRequestUrl: string;
     finalRequestUrl?: string;
 }
 
 /** @internal */
-export async function domCrawlerEnqueueLinks({ options, window, requestQueue, originalRequestUrl, finalRequestUrl }: EnqueueLinksInternalOptions) {
+export async function domCrawlerEnqueueLinks({
+    options,
+    window,
+    requestQueue,
+    originalRequestUrl,
+    finalRequestUrl,
+}: EnqueueLinksInternalOptions) {
     if (!window) {
         throw new Error('Cannot enqueue links because the JSDOM is not available.');
     }
@@ -243,7 +364,11 @@ export async function domCrawlerEnqueueLinks({ options, window, requestQueue, or
         userProvidedBaseUrl: options?.baseUrl,
     });
 
-    const urls = extractUrlsFromWindow(window, options?.selector ?? 'a', options?.baseUrl ?? finalRequestUrl ?? originalRequestUrl);
+    const urls = extractUrlsFromWindow(
+        window,
+        options?.selector ?? 'a',
+        options?.baseUrl ?? finalRequestUrl ?? originalRequestUrl,
+    );
 
     return enqueueLinks({
         requestQueue,
@@ -265,12 +390,7 @@ function extractUrlsFromWindow(window: DOMWindow, selector: string, baseUrl: str
             if (href === undefined) {
                 return undefined;
             }
-
-            try {
-                return (new URL(href, baseUrl)).href;
-            } catch {
-                return undefined;
-            }
+            return tryAbsoluteURL(href, baseUrl);
         })
         .filter((href) => href !== undefined && href !== '') as string[];
 }
@@ -299,6 +419,9 @@ function extractUrlsFromWindow(window: DOMWindow, selector: string, baseUrl: str
  * await crawler.run();
  * ```
  */
-export function createJSDOMRouter<Context extends JSDOMCrawlingContext = JSDOMCrawlingContext>() {
-    return Router.create<Context>();
+export function createJSDOMRouter<
+    Context extends JSDOMCrawlingContext = JSDOMCrawlingContext,
+    UserData extends Dictionary = GetUserDataFromRequest<Context['request']>,
+>(routes?: RouterRoutes<Context, UserData>) {
+    return Router.create<Context>(routes);
 }

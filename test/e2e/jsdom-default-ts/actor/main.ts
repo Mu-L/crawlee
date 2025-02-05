@@ -1,22 +1,26 @@
-import { Actor } from 'apify';
+import assert from 'node:assert';
+
 import { JSDOMCrawler, Dataset } from '@crawlee/jsdom';
-import { ApifyStorageLocal } from '@apify/storage-local';
+import { Actor } from 'apify';
 
 if (process.env.STORAGE_IMPLEMENTATION === 'LOCAL') {
-    await Actor.init({ storage: new ApifyStorageLocal() });
+    // @ts-ignore
+    await Actor.init({ storage: new (await import('@apify/storage-local')).ApifyStorageLocal() });
 } else {
     await Actor.init();
 }
 
 const crawler = new JSDOMCrawler();
 
-crawler.router.addDefaultHandler(async ({ window, enqueueLinks, request, log }) => {
+crawler.router.addDefaultHandler(async ({ window, document, enqueueLinks, request, log }) => {
     const { url } = request;
     await enqueueLinks({
         globs: ['https://crawlee.dev/docs/**'],
     });
 
     const pageTitle = window.document.title;
+    const { title } = document;
+    assert.strictEqual(pageTitle, title);
     log.info(`URL: ${url} TITLE: ${pageTitle}`);
 
     await Dataset.pushData({ url, pageTitle });

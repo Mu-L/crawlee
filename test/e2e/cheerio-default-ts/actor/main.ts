@@ -1,9 +1,9 @@
-import { Actor } from 'apify';
 import { CheerioCrawler, Dataset } from '@crawlee/cheerio';
-import { ApifyStorageLocal } from '@apify/storage-local';
+import { Actor } from 'apify';
 
 if (process.env.STORAGE_IMPLEMENTATION === 'LOCAL') {
-    await Actor.init({ storage: new ApifyStorageLocal() });
+    // @ts-ignore
+    await Actor.init({ storage: new (await import('@apify/storage-local')).ApifyStorageLocal() });
 } else {
     await Actor.init();
 }

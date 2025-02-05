@@ -1,19 +1,26 @@
-import type { AddressInfo } from 'net';
 import type { Server } from 'http';
 import http from 'http';
+import type { AddressInfo } from 'net';
 import { promisify } from 'util';
 
-import type { Server as ProxyChainServer } from 'proxy-chain';
-import puppeteer from 'puppeteer';
-import playwright from 'playwright';
-
-import { PuppeteerPlugin, PlaywrightPlugin, PuppeteerController, PlaywrightController, PlaywrightBrowser, LaunchContext } from '@crawlee/browser-pool';
+import {
+    PuppeteerPlugin,
+    PlaywrightPlugin,
+    PuppeteerController,
+    PlaywrightController,
+    PlaywrightBrowser,
+    LaunchContext,
+} from '@crawlee/browser-pool';
 import type { UnwrapPromise, CommonLibrary } from '@crawlee/browser-pool';
-
+import playwright from 'playwright';
+import type { Server as ProxyChainServer } from 'proxy-chain';
+import type { Browser } from 'puppeteer';
+import puppeteer from 'puppeteer';
 import { runExampleComServer } from 'test/shared/_helper';
+
 import { createProxyServer } from './create-proxy-server';
 
-jest.setTimeout(120000);
+vitest.setConfig({ testTimeout: 120_000 });
 
 let port: number;
 let server: Server;
@@ -32,11 +39,15 @@ const runPluginTest = <
     P extends typeof PlaywrightPlugin | typeof PuppeteerPlugin,
     C extends typeof PuppeteerController | typeof PlaywrightController,
     L extends CommonLibrary,
->(Plugin: P, Controller: C, library: L) => {
+>(
+    Plugin: P,
+    Controller: C,
+    library: L,
+) => {
     let plugin = new Plugin(library as never);
 
     describe(`${plugin.constructor.name} - ${'name' in library ? library.name!() : ''} general`, () => {
-        let browser: playwright.Browser | UnwrapPromise<ReturnType<typeof puppeteer['launch']>> | undefined;
+        let browser: playwright.Browser | UnwrapPromise<ReturnType<(typeof puppeteer)['launch']>> | undefined;
 
         beforeEach(() => {
             plugin = new Plugin(library as never);
@@ -120,7 +131,9 @@ const runPluginTest = <
             browserController.activate();
 
             const page = await browserController.newPage();
-            await browserController.setCookies(page as never, [{ name: 'TEST', value: 'TESTER-COOKIE', url: serverAddress }]);
+            await browserController.setCookies(page as never, [
+                { name: 'TEST', value: 'TESTER-COOKIE', url: serverAddress },
+            ]);
             await page.goto(serverAddress, { waitUntil: 'domcontentloaded' });
 
             const cookies = await browserController.getCookies(page as never);
@@ -145,7 +158,9 @@ const runPluginTest = <
 
                 expect(false).toBe(true);
             } catch (error: any) {
-                expect(error.message).toBe('A new page can be created with provided context only when using incognito pages or experimental containers.');
+                expect(error.message).toBe(
+                    'A new page can be created with provided context only when using incognito pages or experimental containers.',
+                );
             }
         });
     });
@@ -177,7 +192,7 @@ describe('Plugins', () => {
     });
 
     describe('Puppeteer specifics', () => {
-        let browser: puppeteer.Browser;
+        let browser: Browser;
 
         afterEach(async () => {
             await browser.close();
@@ -204,7 +219,7 @@ describe('Plugins', () => {
             const page = await browser.newPage();
             const response = await page.goto(`http://127.0.0.1:${(target.address() as AddressInfo).port}`);
 
-            const text = await response.text();
+            const text = await response!.text();
 
             expect(text).toBe('127.0.0.2');
 
@@ -232,7 +247,7 @@ describe('Plugins', () => {
             const page = await browser.newPage();
             const response = await page.goto(`http://127.0.0.1:${(target.address() as AddressInfo).port}`);
 
-            const text = await response.text();
+            const text = await response!.text();
 
             expect(text).toBe('127.0.0.3');
 
@@ -254,7 +269,7 @@ describe('Plugins', () => {
             const page = await browserController.newPage();
             const browserContext = page.browserContext();
 
-            expect(browserContext.isIncognito()).toBeFalsy();
+            expect(browserContext.id).toBeFalsy();
         });
 
         test('should use incognito pages by option', async () => {
@@ -270,7 +285,7 @@ describe('Plugins', () => {
             const page = await browserController.newPage();
             const browserContext = page.browserContext();
 
-            expect(browserContext.isIncognito()).toBeTruthy();
+            expect(browserContext.id).toBeTruthy();
         });
 
         test('should pass launch options to browser', async () => {
@@ -279,9 +294,7 @@ describe('Plugins', () => {
             const userAgent = 'HelloWorld';
 
             const launchOptions = {
-                args: [
-                    `--user-agent=${userAgent}`,
-                ],
+                args: [`--user-agent=${userAgent}`],
             };
 
             const launchContext = plugin.createLaunchContext({ launchOptions });
@@ -334,14 +347,17 @@ describe('Plugins', () => {
                 const proxyUrl = `http://127.0.0.2:${unprotectedProxy.port}`;
                 const plugin = new PlaywrightPlugin(playwright[browserName]);
 
-                const launchOptions = browserName === 'chromium' ? {
-                    args: [
-                        // Exclude loopback interface from proxy bypass list,
-                        // so the request to localhost goes through proxy.
-                        // This way there's no need for a 3rd party server.
-                        '--proxy-bypass-list=<-loopback>',
-                    ],
-                } : undefined;
+                const launchOptions =
+                    browserName === 'chromium'
+                        ? {
+                              args: [
+                                  // Exclude loopback interface from proxy bypass list,
+                                  // so the request to localhost goes through proxy.
+                                  // This way there's no need for a 3rd party server.
+                                  '--proxy-bypass-list=<-loopback>',
+                              ],
+                          }
+                        : undefined;
 
                 const context = plugin.createLaunchContext({
                     proxyUrl,
@@ -364,14 +380,17 @@ describe('Plugins', () => {
                 const proxyUrl = `http://foo:bar@127.0.0.3:${protectedProxy.port}`;
                 const plugin = new PlaywrightPlugin(playwright[browserName]);
 
-                const launchOptions = browserName === 'chromium' ? {
-                    args: [
-                        // Exclude loopback interface from proxy bypass list,
-                        // so the request to localhost goes through proxy.
-                        // This way there's no need for a 3rd party server.
-                        '--proxy-bypass-list=<-loopback>',
-                    ],
-                } : undefined;
+                const launchOptions =
+                    browserName === 'chromium'
+                        ? {
+                              args: [
+                                  // Exclude loopback interface from proxy bypass list,
+                                  // so the request to localhost goes through proxy.
+                                  // This way there's no need for a 3rd party server.
+                                  '--proxy-bypass-list=<-loopback>',
+                              ],
+                          }
+                        : undefined;
 
                 const context = plugin.createLaunchContext({
                     proxyUrl,
@@ -461,10 +480,8 @@ describe('Plugins', () => {
                     logger: {
                         isEnabled: () => {
                             ran = true;
-
                             return false;
                         },
-                        // eslint-disable-next-line @typescript-eslint/no-empty-function
                         log: () => {},
                     },
                 };
@@ -538,8 +555,8 @@ describe('Plugins', () => {
                     browser = await plugin.launch(launchContext);
                     const contexts = browser.contexts();
                     expect(contexts).toHaveLength(1);
+
                     // Cast to any to access private property
-                    // eslint-disable-next-line no-underscore-dangle
                     expect(contexts[0]).toEqual((browser as any)._browserContext);
                 });
 
@@ -560,14 +577,21 @@ describe('Plugins', () => {
                     const launchContext = plugin.createLaunchContext();
                     browser = await plugin.launch(launchContext);
 
-                    await expect(browser.newContext())
-                        .rejects
-                        .toThrow('Function `newContext()` is not available in incognito mode');
+                    await expect(browser.newContext()).rejects.toThrow(
+                        'Function `newContext()` is not available in incognito mode',
+                    );
                 });
 
                 test('should have same public interface as playwright browserType', async () => {
                     const plugin = new PlaywrightPlugin(playwright[browserName]);
-                    const originalFunctionNames = ['close', 'contexts', 'isConnected', 'newContext', 'newPage', 'version'] as const;
+                    const originalFunctionNames = [
+                        'close',
+                        'contexts',
+                        'isConnected',
+                        'newContext',
+                        'newPage',
+                        'version',
+                    ] as const;
                     const launchContext = plugin.createLaunchContext({ useIncognitoPages: true });
                     browser = await plugin.launch(launchContext);
 

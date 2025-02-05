@@ -1,9 +1,6 @@
-/* eslint-disable dot-notation */
 import log from '@apify/log';
 import { AutoscaledPool } from '@crawlee/core';
 import { sleep } from '@crawlee/utils';
-
-/* eslint-disable no-underscore-dangle */
 
 describe('AutoscaledPool', () => {
     let logLevel: number;
@@ -22,13 +19,13 @@ describe('AutoscaledPool', () => {
 
         let isFinished = false;
 
-        const runTaskFunction = () => {
+        const runTaskFunction = async () => {
             if (range.length === 1) {
                 isFinished = true;
             }
 
             return new Promise((resolve) => {
-                const item = range.shift();
+                const item = range.shift()!;
                 result.push(item);
                 setTimeout(resolve, 5);
             });
@@ -38,8 +35,8 @@ describe('AutoscaledPool', () => {
             minConcurrency: 1,
             maxConcurrency: 1,
             runTaskFunction,
-            isFinishedFunction: () => Promise.resolve(isFinished),
-            isTaskReadyFunction: () => Promise.resolve(!isFinished),
+            isFinishedFunction: async () => Promise.resolve(isFinished),
+            isTaskReadyFunction: async () => Promise.resolve(!isFinished),
         });
         await pool.run();
 
@@ -52,13 +49,13 @@ describe('AutoscaledPool', () => {
 
         let isFinished = false;
 
-        const runTaskFunction = () => {
+        const runTaskFunction = async () => {
             if (range.length === 1) {
                 isFinished = true;
             }
 
             return new Promise((resolve) => {
-                const item = range.shift();
+                const item = range.shift()!;
                 result.push(item);
                 setTimeout(resolve, 5);
             });
@@ -68,8 +65,8 @@ describe('AutoscaledPool', () => {
             minConcurrency: 10,
             maxConcurrency: 10,
             runTaskFunction,
-            isFinishedFunction: () => Promise.resolve(isFinished),
-            isTaskReadyFunction: () => Promise.resolve(!isFinished),
+            isFinishedFunction: async () => Promise.resolve(isFinished),
+            isTaskReadyFunction: async () => Promise.resolve(!isFinished),
         });
 
         await pool.run();
@@ -83,13 +80,13 @@ describe('AutoscaledPool', () => {
 
         let isFinished = false;
 
-        const runTaskFunction = () => {
+        const runTaskFunction = async () => {
             if (range.length === 1) {
                 isFinished = true;
             }
 
             return new Promise((resolve) => {
-                const item = range.shift();
+                const item = range.shift()!;
                 result.push(item);
                 setTimeout(resolve, 5);
             });
@@ -101,15 +98,15 @@ describe('AutoscaledPool', () => {
             maxConcurrency: 13,
             desiredConcurrency: 9,
             runTaskFunction,
-            isFinishedFunction: () => Promise.resolve(isFinished),
-            isTaskReadyFunction: () => Promise.resolve(!isFinished),
+            isFinishedFunction: async () => isFinished,
+            isTaskReadyFunction: async () => !isFinished,
         });
 
         expect(pool.minConcurrency).toBe(3);
         expect(pool.maxConcurrency).toBe(13);
         expect(pool.desiredConcurrency).toBe(9);
 
-        const promise = await pool.run();
+        const promise = pool.run();
 
         // Test setting concurrency
         pool.minConcurrency = 4;
@@ -325,7 +322,9 @@ describe('AutoscaledPool', () => {
             let count = 0;
             const pool = new AutoscaledPool({
                 maxConcurrency: 1,
-                runTaskFunction: async () => { count++; },
+                runTaskFunction: async () => {
+                    count++;
+                },
                 isFinishedFunction: async () => false,
                 isTaskReadyFunction: async () => {
                     if (count > 1) throw new Error('some-ready-error');
@@ -344,9 +343,12 @@ describe('AutoscaledPool', () => {
         // Run the pool and close it after 3s.
         const pool = new AutoscaledPool({
             minConcurrency: 3,
-            runTaskFunction: async () => sleep(1).then(() => { count++; }),
+            runTaskFunction: async () =>
+                sleep(1).then(() => {
+                    count++;
+                }),
             isFinishedFunction: isFinished,
-            isTaskReadyFunction: async () => !await isFinished(),
+            isTaskReadyFunction: async () => !(await isFinished()),
         });
 
         // @ts-expect-error Overwriting readonly private prop
@@ -369,8 +371,16 @@ describe('AutoscaledPool', () => {
             maxConcurrency: 1,
             runTaskFunction: async () => {
                 await sleep(1);
-                if (counter === 10) { isTaskReady = false; setTimeout(() => { isTaskReady = true; }, 10); }
-                if (counter === 19) { isTaskReady = false; isFinished = true; }
+                if (counter === 10) {
+                    isTaskReady = false;
+                    setTimeout(() => {
+                        isTaskReady = true;
+                    }, 10);
+                }
+                if (counter === 19) {
+                    isTaskReady = false;
+                    isFinished = true;
+                }
                 counter++;
                 finished.push(Date.now());
             },
@@ -390,9 +400,9 @@ describe('AutoscaledPool', () => {
         const pool = new AutoscaledPool({
             minConcurrency: 1,
             maxConcurrency: 100,
-            runTaskFunction: () => Promise.resolve(),
-            isFinishedFunction: () => Promise.resolve(false),
-            isTaskReadyFunction: () => Promise.resolve(true),
+            runTaskFunction: async () => Promise.resolve(),
+            isFinishedFunction: async () => Promise.resolve(false),
+            isTaskReadyFunction: async () => Promise.resolve(true),
             loggingIntervalSecs: null,
         });
         // @ts-expect-error Calling private method
@@ -408,11 +418,12 @@ describe('AutoscaledPool', () => {
                 if (!aborted) {
                     await pool.abort();
                     aborted = true;
-                } else {
-                    return null;
                 }
             },
-            isFinishedFunction: async () => { finished = true; return true; },
+            isFinishedFunction: async () => {
+                finished = true;
+                return true;
+            },
             isTaskReadyFunction: async () => !aborted,
         });
         await pool.run();
@@ -448,7 +459,9 @@ describe('AutoscaledPool', () => {
         let count = 0;
         const results: number[] = [];
         let pauseResolve: (value: unknown) => void;
-        const pausePromise = new Promise((res) => { pauseResolve = res; });
+        const pausePromise = new Promise((res) => {
+            pauseResolve = res;
+        });
 
         const pool = new AutoscaledPool({
             maybeRunIntervalSecs: 0.01,
@@ -465,7 +478,9 @@ describe('AutoscaledPool', () => {
 
         let finished = false;
         const runPromise = pool.run();
-        void runPromise.then(() => { finished = true; });
+        void runPromise.then(() => {
+            finished = true;
+        });
         await pausePromise;
         expect(count).toBe(20);
         expect(finished).toBe(false);
@@ -544,5 +559,3 @@ describe('AutoscaledPool', () => {
         expect(Date.now() - now).toBeGreaterThanOrEqual(1e3);
     }, 10e3);
 });
-
-/* eslint-enable no-underscore-dangle */

@@ -1,14 +1,16 @@
-import type { MemoryStorageOptions } from '@crawlee/memory-storage';
-import { MemoryStorage } from '@crawlee/memory-storage';
-import { pathExistsSync, readFileSync } from 'fs-extra';
-import { join } from 'node:path';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { EventEmitter } from 'node:events';
-import type { Dictionary, StorageClient } from '@crawlee/types';
+import { join } from 'node:path';
+
 import log, { LogLevel } from '@apify/log';
-import { entries } from './typedefs';
-import type { EventManager } from './events';
-import { LocalEventManager } from './events';
+import { MemoryStorage } from '@crawlee/memory-storage';
+import type { MemoryStorageOptions } from '@crawlee/memory-storage';
+import type { Dictionary, StorageClient } from '@crawlee/types';
+import { pathExistsSync, readFileSync } from 'fs-extra';
+
+import { LocalEventManager, type EventManager } from './events';
+import type { StorageManager } from './storages';
+import { entries, type Constructor } from './typedefs';
 
 export interface ConfigurationOptions {
     /**
@@ -95,7 +97,7 @@ export interface ConfigurationOptions {
 
     /**
      Defines the interval of emitting the `systemInfo` event.
-     @default 60_000
+     @default 1_000
      */
     systemInfoIntervalMillis?: number;
 
@@ -251,6 +253,8 @@ export class Configuration {
 
     protected static INTEGER_VARS = ['memoryMbytes', 'persistStateIntervalMillis', 'systemInfoIntervalMillis'];
 
+    protected static COMMA_SEPARATED_LIST_VARS: string[] = [];
+
     protected static DEFAULTS: Dictionary = {
         defaultKeyValueStoreId: 'default',
         defaultDatasetId: 'default',
@@ -262,7 +266,7 @@ export class Configuration {
         purgeOnStart: true,
         headless: true,
         persistStateIntervalMillis: 60_000,
-        systemInfoIntervalMillis: 60_000,
+        systemInfoIntervalMillis: 1_000,
         persistStorage: true,
     };
 
@@ -278,6 +282,8 @@ export class Configuration {
     /** @internal */
     static globalConfig?: Configuration;
 
+    public readonly storageManagers = new Map<Constructor, StorageManager>();
+
     /**
      * Creates new `Configuration` instance with provided options. Env vars will have precedence over those.
      */
@@ -291,7 +297,9 @@ export class Configuration {
         const logLevel = this.get('logLevel');
 
         if (logLevel) {
-            const level = Number.isFinite(+logLevel) ? +logLevel : LogLevel[String(logLevel).toUpperCase() as unknown as LogLevel];
+            const level = Number.isFinite(+logLevel)
+                ? +logLevel
+                : LogLevel[String(logLevel).toUpperCase() as unknown as LogLevel];
             log.setLevel(level as LogLevel);
         }
     }
@@ -336,6 +344,13 @@ export class Configuration {
         if (Configuration.BOOLEAN_VARS.includes(key)) {
             // 0, false and empty string are considered falsy values
             return !['0', 'false', ''].includes(String(value).toLowerCase());
+        }
+
+        if (Configuration.COMMA_SEPARATED_LIST_VARS.includes(key)) {
+            if (!value) return [];
+            return String(value)
+                .split(',')
+                .map((v) => v.trim());
         }
 
         return value;

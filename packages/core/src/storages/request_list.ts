@@ -1,16 +1,16 @@
-import { downloadListOfUrls } from '@crawlee/utils';
 import type { Dictionary } from '@crawlee/types';
+import { downloadListOfUrls } from '@crawlee/utils';
 import ow, { ArgumentError } from 'ow';
+
+import { KeyValueStore } from './key_value_store';
+import { purgeDefaultStorages } from './utils';
+import { Configuration } from '../configuration';
 import type { EventManager } from '../events';
 import { EventType } from '../events';
-import { Configuration } from '../configuration';
 import { log } from '../log';
-import type { RequestOptions } from '../request';
-import { Request } from '../request';
-import { createDeserialize, serializeArray } from '../serialization';
-import { KeyValueStore } from './key_value_store';
 import type { ProxyConfiguration } from '../proxy_configuration';
-import { purgeDefaultStorages } from './utils';
+import { type InternalSource, type RequestOptions, Request, type Source } from '../request';
+import { createDeserialize, serializeArray } from '../serialization';
 
 /** @internal */
 export const STATE_PERSISTENCE_KEY = 'REQUEST_LIST_STATE';
@@ -19,6 +19,80 @@ export const STATE_PERSISTENCE_KEY = 'REQUEST_LIST_STATE';
 export const REQUESTS_PERSISTENCE_KEY = 'REQUEST_LIST_REQUESTS';
 
 const CONTENT_TYPE_BINARY = 'application/octet-stream';
+
+/**
+ * Represents a static list of URLs to crawl.
+ */
+export interface IRequestList {
+    /**
+     * Returns the total number of unique requests present in the list.
+     */
+    length(): number;
+
+    /**
+     * Returns `true` if all requests were already handled and there are no more left.
+     */
+    isFinished(): Promise<boolean>;
+
+    /**
+     * Resolves to `true` if the next call to {@apilink IRequestList.fetchNextRequest} function
+     * would return `null`, otherwise it resolves to `false`.
+     * Note that even if the list is empty, there might be some pending requests currently being processed.
+     */
+    isEmpty(): Promise<boolean>;
+
+    /**
+     * Returns number of handled requests.
+     */
+    handledCount(): number;
+
+    /**
+     * Persists the current state of the `IRequestList` into the default {@apilink KeyValueStore}.
+     * The state is persisted automatically in regular intervals, but calling this method manually
+     * is useful in cases where you want to have the most current state available after you pause
+     * or stop fetching its requests. For example after you pause or abort a crawl. Or just before
+     * a server migration.
+     */
+    persistState(): Promise<void>;
+
+    /**
+     * Gets the next {@apilink Request} to process. First, the function gets a request previously reclaimed
+     * using the {@apilink RequestList.reclaimRequest} function, if there is any.
+     * Otherwise it gets the next request from sources.
+     *
+     * The function's `Promise` resolves to `null` if there are no more
+     * requests to process.
+     */
+    fetchNextRequest(): Promise<Request | null>;
+
+    /**
+     * Gets the next {@apilink Request} to process. First, the function gets a request previously reclaimed
+     * using the {@apilink RequestList.reclaimRequest} function, if there is any.
+     * Otherwise it gets the next request from sources.
+     *
+     * The function resolves to `null` if there are no more requests to process.
+     *
+     * Can be used to iterate over the `RequestList` instance in a `for await .. of` loop.
+     * Provides an alternative for the repeated use of `fetchNextRequest`.
+     */
+    [Symbol.asyncIterator](): AsyncGenerator<Request>;
+
+    /**
+     * Reclaims request to the list if its processing failed.
+     * The request will become available in the next `this.fetchNextRequest()`.
+     */
+    reclaimRequest(request: Request): Promise<void>;
+
+    /**
+     * Marks request as handled after successful processing.
+     */
+    markRequestHandled(request: Request): Promise<void>;
+
+    /**
+     * @internal
+     */
+    inProgress: Set<string>;
+}
 
 export interface RequestListOptions {
     /**
@@ -50,11 +124,11 @@ export interface RequestListOptions {
      *
      *     // Get list of URLs from a Google Sheets document. Just add "/gviz/tq?tqx=out:csv" to the Google Sheet URL.
      *     // For details, see https://help.apify.com/en/articles/2906022-scraping-a-list-of-urls-from-a-google-sheets-document
-     *     { requestsFromUrl: 'https://docs.google.com/spreadsheets/d/1GA5sSQhQjB_REes8I5IKg31S-TuRcznWOPjcpNqtxmU/gviz/tq?tqx=out:csv' }
+     *     { requestsFromUrl: 'https://docs.google.com/spreadsheets/d/1-2mUcRAiBbCTVA5KcpFdEYWflLMLp9DDU3iJutvES4w/gviz/tq?tqx=out:csv' }
      * ]
      * ```
      */
-    sources?: Source[];
+    sources?: RequestListSource[];
 
     /**
      * A function that will be called to get the sources for the `RequestList`, but only if `RequestList`
@@ -97,10 +171,10 @@ export interface RequestListOptions {
     sourcesFunction?: RequestListSourcesFunction;
 
     /**
-    *   Used to pass the the proxy configuration for the `requestsFromUrls` objects.
-    *   Takes advantage of the internal address rotation and authentication process.
-    *   If undefined, the `requestsFromUrls` requests will be made without proxy.
-    */
+     * Used to pass the proxy configuration for the `requestsFromUrl` objects.
+     * Takes advantage of the internal address rotation and authentication process.
+     * If undefined, the `requestsFromUrl` requests will be made without proxy.
+     */
     proxyConfiguration?: ProxyConfiguration;
 
     /**
@@ -181,8 +255,8 @@ export interface RequestListOptions {
  * `uniqueKey` properties. You can use the `keepDuplicateUrls` option to do this for you when initializing the
  * `RequestList` from sources.
  *
- * Once you create an instance of `RequestList`, you need to call the {@apilink RequestList.initialize} function
- * before the instance can be used. After that, no more URLs can be added to the list.
+ * `RequestList` doesn't have a public constructor, you need to create it with the asynchronous {@apilink RequestList.open} function. After
+ * the request list is created, no more URLs can be added to it.
  * Unlike {@apilink RequestQueue}, `RequestList` is static but it can contain even millions of URLs.
  * > Note that `RequestList` can be used together with `RequestQueue` by the same crawler.
  * > In such cases, each request from `RequestList` is enqueued into `RequestQueue` first and then consumed from the latter.
@@ -204,8 +278,6 @@ export interface RequestListOptions {
  *
  * **Basic usage:**
  * ```javascript
- * // Use a helper function to simplify request list initialization.
- * // State and sources are automatically persisted. This is a preferred usage.
  * const requestList = await RequestList.open('my-request-list', [
  *     'http://www.example.com/page-1',
  *     { url: 'http://www.example.com/page-2', method: 'POST', userData: { foo: 'bar' }},
@@ -215,7 +287,6 @@ export interface RequestListOptions {
  *
  * **Advanced usage:**
  * ```javascript
- * // Use the constructor to get more control over the initialization.
  * const requestList = await RequestList.open(null, [
  *     // Separate requests
  *     { url: 'http://www.example.com/page-1', method: 'GET', headers: { ... } },
@@ -232,7 +303,7 @@ export interface RequestListOptions {
  * ```
  * @category Sources
  */
-export class RequestList {
+export class RequestList implements IRequestList {
     private log = log.child({ prefix: 'RequestList' });
 
     /**
@@ -240,7 +311,7 @@ export class RequestList {
      * All requests in the array have distinct uniqueKey!
      * @internal
      */
-    requests: Request[] = [];
+    requests: (Request | RequestOptions)[] = [];
 
     /** Index to the next item in requests array to fetch. All previous requests are either handled or in progress. */
     private nextIndex = 0;
@@ -279,7 +350,7 @@ export class RequestList {
     private initialState?: RequestListState;
     private store?: KeyValueStore;
     private keepDuplicateUrls: boolean;
-    private sources: Source[];
+    private sources: RequestListSource[];
     private sourcesFunction?: RequestListSourcesFunction;
     private proxyConfiguration?: ProxyConfiguration;
     private events: EventManager;
@@ -302,21 +373,27 @@ export class RequestList {
         } = options;
 
         if (!(sources || sourcesFunction)) {
-            throw new ArgumentError('At least one of "sources" or "sourcesFunction" must be provided.', this.constructor);
+            throw new ArgumentError(
+                'At least one of "sources" or "sourcesFunction" must be provided.',
+                this.constructor,
+            );
         }
-        ow(options, ow.object.exactShape({
-            sources: ow.optional.array, // check only for array and not subtypes to avoid iteration over the whole thing
-            sourcesFunction: ow.optional.function,
-            persistStateKey: ow.optional.string,
-            persistRequestsKey: ow.optional.string,
-            state: ow.optional.object.exactShape({
-                nextIndex: ow.number,
-                nextUniqueKey: ow.string,
-                inProgress: ow.object,
+        ow(
+            options,
+            ow.object.exactShape({
+                sources: ow.optional.array, // check only for array and not subtypes to avoid iteration over the whole thing
+                sourcesFunction: ow.optional.function,
+                persistStateKey: ow.optional.string,
+                persistRequestsKey: ow.optional.string,
+                state: ow.optional.object.exactShape({
+                    nextIndex: ow.number,
+                    nextUniqueKey: ow.string,
+                    inProgress: ow.object,
+                }),
+                keepDuplicateUrls: ow.optional.boolean,
+                proxyConfiguration: ow.optional.object,
             }),
-            keepDuplicateUrls: ow.optional.boolean,
-            proxyConfiguration: ow.optional.object,
-        }));
+        );
 
         this.persistStateKey = persistStateKey ? `SDK_${persistStateKey}` : persistStateKey;
         this.persistRequestsKey = persistRequestsKey ? `SDK_${persistRequestsKey}` : persistRequestsKey;
@@ -330,7 +407,7 @@ export class RequestList {
         this.sources = sources ? [...sources] : [];
         this.sourcesFunction = sourcesFunction;
 
-        // The proxy configuration used for `requestsFromUrls` requests.
+        // The proxy configuration used for `requestsFromUrl` requests.
         this.proxyConfiguration = proxyConfiguration;
     }
 
@@ -344,7 +421,7 @@ export class RequestList {
         }
 
         this.isLoading = true;
-        await purgeDefaultStorages();
+        await purgeDefaultStorages({ onlyPurgeOnce: true });
 
         const [state, persistedRequests] = await this._loadStateAndPersistedRequests();
 
@@ -428,11 +505,7 @@ export class RequestList {
     }
 
     /**
-     * Persists the current state of the `RequestList` into the default {@apilink KeyValueStore}.
-     * The state is persisted automatically in regular intervals, but calling this method manually
-     * is useful in cases where you want to have the most current state available after you pause
-     * or stop fetching its requests. For example after you pause or abort a crawl. Or just before
-     * a server migration.
+     * @inheritDoc
      */
     async persistState(): Promise<void> {
         if (!this.persistStateKey) {
@@ -474,16 +547,22 @@ export class RequestList {
         if (state.nextIndex > this.requests.length) {
             throw new Error('The state object is not consistent with RequestList, too few requests loaded.');
         }
-        if (state.nextIndex < this.requests.length
-            && this.requests[state.nextIndex].uniqueKey !== state.nextUniqueKey) {
-            throw new Error('The state object is not consistent with RequestList the order of URLs seems to have changed.');
+        if (
+            state.nextIndex < this.requests.length &&
+            this.requests[state.nextIndex].uniqueKey !== state.nextUniqueKey
+        ) {
+            throw new Error(
+                'The state object is not consistent with RequestList the order of URLs seems to have changed.',
+            );
         }
 
         const deleteFromInProgress: string[] = [];
         state.inProgress.forEach((uniqueKey) => {
             const index = this.uniqueKeyToIndex[uniqueKey];
             if (typeof index !== 'number') {
-                throw new Error('The state object is not consistent with RequestList. Unknown uniqueKey is present in the state.');
+                throw new Error(
+                    'The state object is not consistent with RequestList. Unknown uniqueKey is present in the state.',
+                );
             }
             if (index >= state.nextIndex) {
                 deleteFromInProgress.push(uniqueKey);
@@ -507,9 +586,12 @@ export class RequestList {
         // As a workaround, we just remove all inProgress requests whose index >= nextIndex,
         // since they will be crawled again.
         if (deleteFromInProgress.length) {
-            this.log.warning('RequestList\'s in-progress field is not consistent, skipping invalid in-progress entries', {
-                deleteFromInProgress,
-            });
+            this.log.warning(
+                "RequestList's in-progress field is not consistent, skipping invalid in-progress entries",
+                {
+                    deleteFromInProgress,
+                },
+            );
             for (const uniqueKey of deleteFromInProgress) {
                 this.inProgress.delete(uniqueKey);
             }
@@ -528,7 +610,7 @@ export class RequestList {
         let persistedRequests!: Buffer;
 
         if (this.initialState) {
-            state = await this.initialState;
+            state = this.initialState;
             this.log.debug('Loaded state from options.state argument.');
         } else if (this.persistStateKey) {
             state = await this._getPersistedState(this.persistStateKey);
@@ -552,17 +634,13 @@ export class RequestList {
 
         return {
             nextIndex: this.nextIndex,
-            nextUniqueKey: this.nextIndex < this.requests.length
-                ? this.requests[this.nextIndex].uniqueKey
-                : null,
+            nextUniqueKey: this.nextIndex < this.requests.length ? this.requests[this.nextIndex].uniqueKey! : null,
             inProgress: [...this.inProgress],
         };
     }
 
     /**
-     * Resolves to `true` if the next call to {@apilink RequestList.fetchNextRequest} function
-     * would return `null`, otherwise it resolves to `false`.
-     * Note that even if the list is empty, there might be some pending requests currently being processed.
+     * @inheritDoc
      */
     async isEmpty(): Promise<boolean> {
         this._ensureIsInitialized();
@@ -571,7 +649,7 @@ export class RequestList {
     }
 
     /**
-     * Returns `true` if all requests were already handled and there are no more left.
+     * @inheritDoc
      */
     async isFinished(): Promise<boolean> {
         this._ensureIsInitialized();
@@ -580,12 +658,7 @@ export class RequestList {
     }
 
     /**
-     * Gets the next {@apilink Request} to process. First, the function gets a request previously reclaimed
-     * using the {@apilink RequestList.reclaimRequest} function, if there is any.
-     * Otherwise it gets the next request from sources.
-     *
-     * The function's `Promise` resolves to `null` if there are no more
-     * requests to process.
+     * @inheritDoc
      */
     async fetchNextRequest(): Promise<Request | null> {
         this._ensureIsInitialized();
@@ -595,23 +668,44 @@ export class RequestList {
         if (uniqueKey) {
             this.reclaimed.delete(uniqueKey);
             const index = this.uniqueKeyToIndex[uniqueKey];
-            return this.requests[index];
+            return this.ensureRequest(this.requests[index], index);
         }
 
         // Otherwise return next request.
         if (this.nextIndex < this.requests.length) {
-            const request = this.requests[this.nextIndex];
-            this.inProgress.add(request.uniqueKey);
+            const index = this.nextIndex;
+            const request = this.requests[index];
+            this.inProgress.add(request.uniqueKey!);
             this.nextIndex++;
             this.isStatePersisted = false;
-            return request;
+            return this.ensureRequest(request, index);
         }
 
         return null;
     }
 
     /**
-     * Marks request as handled after successful processing.
+     * @inheritDoc
+     */
+    async *[Symbol.asyncIterator]() {
+        while (true) {
+            const req = await this.fetchNextRequest();
+            if (!req) break;
+            yield req;
+        }
+    }
+
+    private ensureRequest(requestLike: Request | RequestOptions, index: number): Request {
+        if (requestLike instanceof Request) {
+            return requestLike;
+        }
+
+        this.requests[index] = new Request(requestLike);
+        return this.requests[index] as Request;
+    }
+
+    /**
+     * @inheritDoc
      */
     async markRequestHandled(request: Request): Promise<void> {
         const { uniqueKey } = request;
@@ -625,8 +719,7 @@ export class RequestList {
     }
 
     /**
-     * Reclaims request to the list if its processing failed.
-     * The request will become available in the next `this.fetchNextRequest()`.
+     * @inheritDoc
      */
     async reclaimRequest(request: Request): Promise<void> {
         const { uniqueKey } = request;
@@ -676,14 +769,18 @@ export class RequestList {
         // Download remote resource and parse URLs.
         let urlsArr;
         try {
-            urlsArr = await this._downloadListOfUrls({ url: requestsFromUrl, urlRegExp: regex, proxyUrl: await this.proxyConfiguration?.newUrl() });
+            urlsArr = await this._downloadListOfUrls({
+                url: requestsFromUrl,
+                urlRegExp: regex,
+                proxyUrl: await this.proxyConfiguration?.newUrl(),
+            });
         } catch (err) {
             throw new Error(`Cannot fetch a request list from ${requestsFromUrl}: ${err}`);
         }
 
         // Skip if resource contained no URLs.
         if (!urlsArr.length) {
-            this.log.warning('list fetched, but it is empty.', { requestsFromUrl, regex });
+            this.log.warning('The fetched list contains no valid URLs.', { requestsFromUrl, regex });
             return [];
         }
 
@@ -695,20 +792,22 @@ export class RequestList {
      * If the `source` parameter is a string or plain object and not an instance
      * of a `Request`, then the function creates a `Request` instance.
      */
-    protected _addRequest(source: Source) {
-        let request;
+    protected _addRequest(source: RequestListSource) {
+        let request: Request | RequestOptions;
         const type = typeof source;
+
         if (type === 'string') {
-            request = new Request({ url: source as string });
+            request = { url: source as string };
         } else if (source instanceof Request) {
             request = source;
         } else if (source && type === 'object') {
-            request = new Request(source as RequestOptions);
+            request = source as RequestOptions;
         } else {
             throw new Error(`Cannot create Request from type: ${type}`);
         }
 
         const hasUniqueKey = Reflect.has(Object(source), 'uniqueKey');
+        request.uniqueKey ??= Request.computeUniqueKey(request as any);
 
         // Add index to uniqueKey if duplicates are to be kept
         if (this.keepDuplicateUrls && !hasUniqueKey) {
@@ -723,7 +822,9 @@ export class RequestList {
             this.uniqueKeyToIndex[uniqueKey] = this.requests.length;
             this.requests.push(request);
         } else if (this.keepDuplicateUrls) {
-            this.log.warning(`Duplicate uniqueKey: ${uniqueKey} found while the keepDuplicateUrls option was set. Check your sources' unique keys.`);
+            this.log.warning(
+                `Duplicate uniqueKey: ${uniqueKey} found while the keepDuplicateUrls option was set. Check your sources' unique keys.`,
+            );
         }
     }
 
@@ -733,7 +834,7 @@ export class RequestList {
      */
     protected _ensureUniqueKeyValid(uniqueKey: string): void {
         if (typeof uniqueKey !== 'string' || !uniqueKey) {
-            throw new Error('Request object\'s uniqueKey must be a non-empty string');
+            throw new Error("Request object's uniqueKey must be a non-empty string");
         }
     }
 
@@ -754,7 +855,9 @@ export class RequestList {
      */
     protected _ensureIsInitialized(): void {
         if (!this.isInitialized) {
-            throw new Error('RequestList is not initialized; you must call "await requestList.initialize()" before using it!');
+            throw new Error(
+                'RequestList is not initialized; you must call "await requestList.initialize()" before using it!',
+            );
         }
     }
 
@@ -768,7 +871,7 @@ export class RequestList {
     }
 
     /**
-     * Returns number of handled requests.
+     * @inheritDoc
      */
     handledCount(): number {
         this._ensureIsInitialized();
@@ -829,7 +932,11 @@ export class RequestList {
      *   the {@apilink RequestListOptions.persistStateKey} and {@apilink RequestListOptions.persistRequestsKey}
      *   options and the `sources` parameter supersedes the {@apilink RequestListOptions.sources} option.
      */
-    static async open(listNameOrOptions: string | null | RequestListOptions, sources?: Source[], options: RequestListOptions = {}): Promise<RequestList> {
+    static async open(
+        listNameOrOptions: string | null | RequestListOptions,
+        sources?: RequestListSource[],
+        options: RequestListOptions = {},
+    ): Promise<RequestList> {
         if (listNameOrOptions != null && typeof listNameOrOptions === 'object') {
             options = { ...listNameOrOptions, ...options };
             const rl = new RequestList(options);
@@ -842,13 +949,16 @@ export class RequestList {
 
         ow(listName, ow.optional.any(ow.string, ow.null));
         ow(sources, ow.array);
-        ow(options, ow.object.is((v) => !Array.isArray(v)));
+        ow(
+            options,
+            ow.object.is((v) => !Array.isArray(v)),
+        );
 
         const rl = new RequestList({
             ...options,
-            persistStateKey: listName ? `${listName}-${STATE_PERSISTENCE_KEY}` : undefined,
-            persistRequestsKey: listName ? `${listName}-${REQUESTS_PERSISTENCE_KEY}` : undefined,
-            sources,
+            persistStateKey: listName ? `${listName}-${STATE_PERSISTENCE_KEY}` : options.persistStateKey,
+            persistRequestsKey: listName ? `${listName}-${REQUESTS_PERSISTENCE_KEY}` : options.persistRequestsKey,
+            sources: sources ?? options.sources,
         });
         await rl.initialize();
 
@@ -858,7 +968,9 @@ export class RequestList {
     /**
      * @internal wraps public utility for mocking purposes
      */
-    private async _downloadListOfUrls(options: { url: string; urlRegExp?: RegExp; proxyUrl?: string }): Promise<string[]> {
+    private async _downloadListOfUrls(options: { url: string; urlRegExp?: RegExp; proxyUrl?: string }): Promise<
+        string[]
+    > {
         return downloadListOfUrls(options);
     }
 }
@@ -880,7 +992,6 @@ export class RequestList {
  * ```
  */
 export interface RequestListState {
-
     /** Position of the next request to be processed. */
     nextIndex: number;
 
@@ -889,9 +1000,7 @@ export interface RequestListState {
 
     /** Array of request keys representing those that being processed at the moment. */
     inProgress: string[];
-
 }
 
-export type Source = string | (Partial<RequestOptions> & { requestsFromUrl?: string; regex?: RegExp }) | Request;
-interface InternalSource { requestsFromUrl: string; regex?: RegExp }
-export type RequestListSourcesFunction = () => Promise<Source[]>;
+type RequestListSource = string | Source;
+export type RequestListSourcesFunction = () => Promise<RequestListSource[]>;

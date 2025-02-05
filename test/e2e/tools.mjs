@@ -1,16 +1,22 @@
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { execSync as execSyncOriginal } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
-import { execSync as execSyncOriginal } from 'node:child_process';
-import { got } from 'got';
-import fs from 'fs-extra';
+import { fileURLToPath } from 'node:url';
+
 import { Actor } from 'apify';
+import fs from 'fs-extra';
+import { got } from 'got';
+
 // eslint-disable-next-line import/no-relative-packages
 import { URL_NO_COMMAS_REGEX } from '../../packages/utils/dist/index.mjs';
 
+/**
+ * @param {string} command
+ * @param {import('node:child_process').ExecSyncOptions} options
+ */
 function execSync(command, options) {
     return execSyncOriginal(command, { ...options, encoding: 'utf-8' });
 }
@@ -81,7 +87,23 @@ export async function runActor(dirName, memory = 4096) {
         const client = Actor.newClient();
 
         await copyPackages(dirName);
-        execSync('npx -y apify-cli push', { cwd: dirName });
+        try {
+            execSync('npx -y apify-cli@beta push --no-prompt', { cwd: dirName });
+        } catch (err) {
+            console.error(
+                colors.red(`Failed to push actor to the Apify platform. (signal ${colors.yellow(err.signal)})`),
+            );
+
+            if (err.stdout) {
+                console.log(colors.grey(`  STDOUT: `), err.stdout);
+            }
+
+            if (err.stderr) {
+                console.log(colors.red(`  STDERR: `), err.stderr);
+            }
+
+            throw err;
+        }
 
         const actorName = await getActorName(dirName);
         const { items: actors } = await client.actors().list();
@@ -89,7 +111,8 @@ export async function runActor(dirName, memory = 4096) {
 
         const gotClient = got.extend({
             retry: {
-                limit: 0,
+                limit: 2,
+                statusCodes: [500, 502],
             },
             headers: {
                 'user-agent': 'crawlee e2e tests (got)',
@@ -101,20 +124,39 @@ export async function runActor(dirName, memory = 4096) {
 
         // Do NOT use Apify Client yet!
         // See https://github.com/apify/apify-client-js/issues/277
-        const { data: { id: runId } } = await gotClient(`https://api.apify.com/v2/acts/${id}/runs`, {
-            method: 'POST',
-            searchParams: {
-                token: client.token,
-                memory,
-            },
-            headers: {
-                'content-type': contentType,
-            },
-            body: input,
-            retry: {
-                limit: 0,
-            },
-        }).json();
+        let runId;
+
+        try {
+            const {
+                data: { id: foundRunId },
+            } = await gotClient(`https://api.apify.com/v2/acts/${id}/runs`, {
+                method: 'POST',
+                searchParams: {
+                    memory,
+                },
+                headers: {
+                    'content-type': contentType,
+                    authorization: `Bearer ${client.token}`,
+                },
+                body: input,
+                retry: {
+                    limit: 2,
+                    statusCodes: [500, 502],
+                },
+            }).json();
+
+            runId = foundRunId;
+        } catch (err) {
+            console.error(
+                colors.red(`Failed to start actor run on the Apify platform. (code ${colors.yellow(err.code)})`),
+            );
+
+            if (err.response) {
+                console.log(colors.grey(`  RESPONSE: `), err.response.body || err.response.rawBody?.toString('utf-8'));
+            }
+
+            throw err;
+        }
 
         const {
             defaultKeyValueStoreId,
@@ -136,14 +178,16 @@ export async function runActor(dirName, memory = 4096) {
                     console.log(`[kv] View storage: https://console.apify.com/storage/key-value/${kvResult.id}`);
                 }
 
-                const entries = await Promise.all(keyValueItems.map(async ({ key }) => {
-                    const record = await client.keyValueStore(kvResult.id).getRecord(key, { buffer: true });
+                const entries = await Promise.all(
+                    keyValueItems.map(async ({ key }) => {
+                        const record = await client.keyValueStore(kvResult.id).getRecord(key, { buffer: true });
 
-                    return {
-                        name: record.key,
-                        raw: record.value,
-                    };
-                }));
+                        return {
+                            name: record.key,
+                            raw: record.value,
+                        };
+                    }),
+                );
 
                 return entries.filter(({ name }) => !isPrivateEntry(name));
             }
@@ -151,10 +195,7 @@ export async function runActor(dirName, memory = 4096) {
             return undefined;
         };
 
-        const {
-            startedAt: buildStartedAt,
-            finishedAt: buildFinishedAt,
-        } = await client.build(buildId).get();
+        const { startedAt: buildStartedAt, finishedAt: buildFinishedAt } = await client.build(buildId).get();
 
         const buildTook = (buildFinishedAt.getTime() - buildStartedAt.getTime()) / 1000;
         console.log(`[build] View build log: https://api.apify.com/v2/logs/${buildId} [build took ${buildTook}s]`);
@@ -185,6 +226,13 @@ export async function runActor(dirName, memory = 4096) {
         }
 
         if (input) {
+            await Actor.init({
+                // @ts-ignore installed only optionally run `run.mjs` script
+                storage:
+                    process.env.STORAGE_IMPLEMENTATION === 'LOCAL'
+                        ? new (await import('@apify/storage-local')).ApifyStorageLocal()
+                        : undefined,
+            });
             await Actor.setValue('INPUT', input, { contentType });
         }
 
@@ -233,16 +281,11 @@ async function copyPackages(dirName) {
         Object.assign(dependencies, overrides.apify);
     }
 
-    // We don't need to copy the following packages
-    delete dependencies['@apify/storage-local'];
-    delete dependencies['apify-client'];
-    delete dependencies['deep-equal'];
-    delete dependencies['playwright-core'];
-    delete dependencies.apify;
-    delete dependencies.puppeteer;
-    delete dependencies.playwright;
-
     for (const dependency of Object.values(dependencies)) {
+        if (!dependency.startsWith('file:')) {
+            continue;
+        }
+
         const packageDirName = dependency.split('/').pop();
         const srcDir = join(srcPackagesDir, packageDirName, 'dist');
         const destDir = join(destPackagesDir, packageDirName, 'dist');
@@ -276,7 +319,9 @@ export async function getApifyToken() {
     const authPath = join(homedir(), '.apify', 'auth.json');
 
     if (!existsSync(authPath)) {
-        throw new Error('You need to be logged in with your Apify account to run E2E tests. Call "apify login" to fix that.');
+        throw new Error(
+            'You need to be logged in with your Apify account to run E2E tests. Call "apify login" to fix that.',
+        );
     }
 
     const { token } = await fs.readJSON(authPath);
@@ -404,7 +449,7 @@ function checkDatasetItem(item, propName) {
         case 'runCount':
             return Number.isInteger(item.runCount);
         default:
-            return typeof item[propName] === 'string';
+            return ['string', 'number', 'boolean'].includes(typeof item[propName]);
     }
 }
 
@@ -434,4 +479,27 @@ function isItemHidden(item) {
         }
     }
     return true;
+}
+
+/**
+ * @param {any} obj the object to search
+ * @param {string} keyName the key to search for
+ * @returns {boolean}
+ */
+export function hasNestedKey(obj, keyName) {
+    if (typeof obj !== 'object' || obj === null) {
+        return false;
+    }
+
+    for (const key of Object.keys(obj)) {
+        if (key === keyName) {
+            return true;
+        }
+
+        if (typeof obj[key] === 'object' && obj[key] !== null && hasNestedKey(obj[key], keyName)) {
+            return true;
+        }
+    }
+
+    return false;
 }

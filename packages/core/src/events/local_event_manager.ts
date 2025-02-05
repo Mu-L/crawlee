@@ -1,9 +1,11 @@
 import os from 'node:os';
+
 import log from '@apify/log';
 import { betterClearInterval, betterSetInterval } from '@apify/utilities';
 import { getMemoryInfo } from '@crawlee/utils';
-import type { SystemInfo } from '../autoscaling';
+
 import { EventManager, EventType } from './event_manager';
+import type { SystemInfo } from '../autoscaling';
 
 export class LocalEventManager extends EventManager {
     private previousTicks = { idle: 0, total: 0 };
@@ -49,13 +51,16 @@ export class LocalEventManager extends EventManager {
 
     private getCurrentCpuTicks() {
         const cpus = os.cpus();
-        return cpus.reduce((acc, cpu) => {
-            const cpuTimes = Object.values(cpu.times);
-            return {
-                idle: acc.idle + cpu.times.idle,
-                total: acc.total + cpuTimes.reduce((sum, num) => sum + num),
-            };
-        }, { idle: 0, total: 0 });
+        return cpus.reduce(
+            (acc, cpu) => {
+                const cpuTimes = Object.values(cpu.times);
+                return {
+                    idle: acc.idle + cpu.times.idle,
+                    total: acc.total + cpuTimes.reduce((sum, num) => sum + num),
+                };
+            },
+            { idle: 0, total: 0 },
+        );
     }
 
     /**
@@ -65,7 +70,7 @@ export class LocalEventManager extends EventManager {
         return {
             createdAt: new Date(),
             ...this.createCpuInfo(options),
-            ...await this.createMemoryInfo(),
+            ...(await this.createMemoryInfo()),
         } as SystemInfo;
     }
 
@@ -73,7 +78,7 @@ export class LocalEventManager extends EventManager {
         const ticks = this.getCurrentCpuTicks();
         const idleTicksDelta = ticks.idle - this.previousTicks!.idle;
         const totalTicksDelta = ticks.total - this.previousTicks!.total;
-        const usedCpuRatio = totalTicksDelta ? 1 - (idleTicksDelta / totalTicksDelta) : 0;
+        const usedCpuRatio = totalTicksDelta ? 1 - idleTicksDelta / totalTicksDelta : 0;
         Object.assign(this.previousTicks, ticks);
 
         return {

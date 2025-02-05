@@ -1,10 +1,12 @@
+import type { Log } from '@apify/log';
 import ow from 'ow';
-import { ErrorTracker } from '@crawlee/utils';
-import { log as defaultLog } from '../log';
-import { KeyValueStore } from '../storages/key_value_store';
+
+import { ErrorTracker } from './error_tracker';
+import { Configuration } from '../configuration';
 import type { EventManager } from '../events/event_manager';
 import { EventType } from '../events/event_manager';
-import { Configuration } from '../configuration';
+import { log as defaultLog } from '../log';
+import { KeyValueStore } from '../storages/key_value_store';
 
 /**
  * @ignore
@@ -39,6 +41,17 @@ const errorTrackerConfig = {
 };
 
 /**
+ * Persistence-related options to control how and when crawler's data gets persisted.
+ */
+export interface PersistenceOptions {
+    /**
+     * Use this flag to disable or enable periodic persistence to key value store.
+     * @default true
+     */
+    enable?: boolean;
+}
+
+/**
  * The statistics class provides an interface to collecting and logging run
  * statistics for requests.
  *
@@ -54,12 +67,12 @@ export class Statistics {
     /**
      * An error tracker for final retry errors.
      */
-    errorTracker = new ErrorTracker(errorTrackerConfig);
+    errorTracker: ErrorTracker;
 
     /**
      * An error tracker for retry errors prior to the final retry.
      */
-    errorTrackerRetry = new ErrorTracker(errorTrackerConfig);
+    errorTrackerRetry: ErrorTracker;
 
     /**
      * Statistic instance id.
@@ -76,40 +89,61 @@ export class Statistics {
      */
     readonly requestRetryHistogram: number[] = [];
 
-    private keyValueStore?: KeyValueStore = undefined;
-    private persistStateKey = `SDK_CRAWLER_STATISTICS_${this.id}`;
+    /**
+     * Contains the associated Configuration instance
+     */
+    private readonly config: Configuration;
+
+    protected keyValueStore?: KeyValueStore = undefined;
+    protected persistStateKey = `SDK_CRAWLER_STATISTICS_${this.id}`;
     private logIntervalMillis: number;
     private logMessage: string;
     private listener: () => Promise<void>;
     private requestsInProgress = new Map<number | string, Job>();
-    private readonly log = defaultLog.child({ prefix: 'Statistics' });
+    private readonly log: Log;
     private instanceStart!: number;
     private logInterval: unknown;
     private events: EventManager;
+    private persistenceOptions: PersistenceOptions;
 
     /**
      * @internal
      */
     constructor(options: StatisticsOptions = {}) {
-        ow(options, ow.object.exactShape({
-            logIntervalSecs: ow.optional.number,
-            logMessage: ow.optional.string,
-            keyValueStore: ow.optional.object,
-            config: ow.optional.object,
-        }));
+        ow(
+            options,
+            ow.object.exactShape({
+                logIntervalSecs: ow.optional.number,
+                logMessage: ow.optional.string,
+                log: ow.optional.object,
+                keyValueStore: ow.optional.object,
+                config: ow.optional.object,
+                persistenceOptions: ow.optional.object,
+                saveErrorSnapshots: ow.optional.boolean,
+            }),
+        );
 
         const {
             logIntervalSecs = 60,
             logMessage = 'Statistics',
             keyValueStore,
             config = Configuration.getGlobalConfig(),
+            persistenceOptions = {
+                enable: true,
+            },
+            saveErrorSnapshots = false,
         } = options;
 
+        this.log = (options.log ?? defaultLog).child({ prefix: 'Statistics' });
+        this.errorTracker = new ErrorTracker({ ...errorTrackerConfig, saveErrorSnapshots });
+        this.errorTrackerRetry = new ErrorTracker({ ...errorTrackerConfig, saveErrorSnapshots });
         this.logIntervalMillis = logIntervalSecs * 1000;
         this.logMessage = logMessage;
         this.keyValueStore = keyValueStore;
         this.listener = this.persistState.bind(this);
         this.events = config.getEventManager();
+        this.config = config;
+        this.persistenceOptions = persistenceOptions;
 
         // initialize by "resetting"
         this.reset();
@@ -149,6 +183,21 @@ export class Statistics {
     }
 
     /**
+     * @param options - Override the persistence options provided in the constructor
+     */
+    async resetStore(options?: PersistenceOptions) {
+        if (!this.persistenceOptions.enable && !options?.enable) {
+            return;
+        }
+
+        if (!this.keyValueStore) {
+            return;
+        }
+
+        await this.keyValueStore.setValue(this.persistStateKey, null);
+    }
+
+    /**
      * Increments the status code counter.
      */
     registerStatusCode(code: number) {
@@ -183,8 +232,10 @@ export class Statistics {
         this.state.requestsFinished++;
         this.state.requestTotalFinishedDurationMillis += jobDurationMillis;
         this._saveRetryCountForJob(job);
-        if (jobDurationMillis < this.state.requestMinDurationMillis) this.state.requestMinDurationMillis = jobDurationMillis;
-        if (jobDurationMillis > this.state.requestMaxDurationMillis) this.state.requestMaxDurationMillis = jobDurationMillis;
+        if (jobDurationMillis < this.state.requestMinDurationMillis)
+            this.state.requestMinDurationMillis = jobDurationMillis;
+        if (jobDurationMillis > this.state.requestMaxDurationMillis)
+            this.state.requestMaxDurationMillis = jobDurationMillis;
         this.requestsInProgress.delete(id);
     }
 
@@ -216,7 +267,8 @@ export class Statistics {
 
         return {
             requestAvgFailedDurationMillis: Math.round(requestTotalFailedDurationMillis / requestsFailed) || Infinity,
-            requestAvgFinishedDurationMillis: Math.round(requestTotalFinishedDurationMillis / requestsFinished) || Infinity,
+            requestAvgFinishedDurationMillis:
+                Math.round(requestTotalFinishedDurationMillis / requestsFinished) || Infinity,
             requestsFinishedPerMinute: Math.round(requestsFinished / totalMinutes) || 0,
             requestsFailedPerMinute: Math.floor(requestsFailed / totalMinutes) || 0,
             requestTotalDurationMillis: requestTotalFinishedDurationMillis + requestTotalFailedDurationMillis,
@@ -230,15 +282,16 @@ export class Statistics {
      * displaying the current state in predefined intervals
      */
     async startCapturing() {
-        this.keyValueStore ??= await KeyValueStore.open();
-
-        await this._maybeLoadStatistics();
+        this.keyValueStore ??= await KeyValueStore.open(null, { config: this.config });
 
         if (this.state.crawlerStartedAt === null) {
             this.state.crawlerStartedAt = new Date();
         }
 
-        this.events.on(EventType.PERSIST_STATE, this.listener);
+        if (this.persistenceOptions.enable) {
+            await this._maybeLoadStatistics();
+            this.events.on(EventType.PERSIST_STATE, this.listener);
+        }
 
         this.logInterval = setInterval(() => {
             this.log.info(this.logMessage, {
@@ -269,8 +322,13 @@ export class Statistics {
 
     /**
      * Persist internal state to the key value store
+     * @param options - Override the persistence options provided in the constructor
      */
-    async persistState() {
+    async persistState(options?: PersistenceOptions) {
+        if (!this.persistenceOptions.enable && !options?.enable) {
+            return;
+        }
+
         // this might be called before startCapturing was called without using await, should not crash
         if (!this.keyValueStore) {
             return;
@@ -347,7 +405,9 @@ export class Statistics {
         const result = {
             ...this.state,
             crawlerLastStartTimestamp: this.instanceStart,
-            crawlerFinishedAt: this.state.crawlerFinishedAt ? new Date(this.state.crawlerFinishedAt).toISOString() : null,
+            crawlerFinishedAt: this.state.crawlerFinishedAt
+                ? new Date(this.state.crawlerFinishedAt).toISOString()
+                : null,
             crawlerStartedAt: this.state.crawlerStartedAt ? new Date(this.state.crawlerStartedAt).toISOString() : null,
             requestRetryHistogram: this.requestRetryHistogram,
             statsId: this.id,
@@ -367,11 +427,50 @@ export class Statistics {
     }
 }
 
-interface StatisticsOptions {
+/**
+ * Configuration for the {@apilink Statistics} instance used by the crawler
+ */
+export interface StatisticsOptions {
+    /**
+     * Interval in seconds to log the current statistics
+     * @default 60
+     */
     logIntervalSecs?: number;
+
+    /**
+     * Message to log with the current statistics
+     * @default 'Statistics'
+     */
     logMessage?: string;
+
+    /**
+     * Parent logger instance, the statistics will create a child logger from this.
+     * @default crawler.log
+     */
+    log?: Log;
+
+    /**
+     * Key value store instance to persist the statistics.
+     * If not provided, the default one will be used when capturing starts
+     */
     keyValueStore?: KeyValueStore;
+
+    /**
+     * Configuration instance to use
+     * @default Configuration.getGlobalConfig()
+     */
     config?: Configuration;
+
+    /**
+     * Control how and when to persist the statistics.
+     */
+    persistenceOptions?: PersistenceOptions;
+
+    /**
+     * Save HTML snapshot (and a screenshot if possible) when an error occurs.
+     * @default false
+     */
+    saveErrorSnapshots?: boolean;
 }
 
 /**
@@ -382,11 +481,8 @@ export interface StatisticPersistedState extends Omit<StatisticState, 'statsPers
     statsId: number;
     requestAvgFailedDurationMillis: number;
     requestAvgFinishedDurationMillis: number;
-    requestsFinishedPerMinute: number;
-    requestsFailedPerMinute: number;
     requestTotalDurationMillis: number;
     requestsTotal: number;
-    crawlerRuntimeMillis: number;
     crawlerLastStartTimestamp: number;
     statsPersistedAt: string;
 }

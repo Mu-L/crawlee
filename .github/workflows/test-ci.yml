@@ -6,8 +6,12 @@ on:
     pull_request:
         branches: [ master ]
 
+env:
+    YARN_IGNORE_NODE: 1
+    RETRY_TESTS: 1
+
 jobs:
-    # NPM install is done in a separate job and cached to speed up the following jobs.
+    # `yarn install` is done in a separate job and cached to speed up the following jobs.
     build_and_test:
         name: Build & Test
         if: (!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, 'docs:'))
@@ -17,64 +21,91 @@ jobs:
             fail-fast: false
             matrix:
                 # tests on windows are extremely unstable
-                # os: [ ubuntu-latest, windows-2019 ]
-                os: [ ubuntu-latest ]
-                node-version: [ 16, 18, 19 ]
+                # os: [ ubuntu-22.04, windows-2019 ]
+                os: [ ubuntu-22.04 ]
+                node-version: [ 16, 18, 20, 22 ]
 
         steps:
             -   name: Cancel Workflow Action
-                uses: styfle/cancel-workflow-action@0.11.0
+                uses: styfle/cancel-workflow-action@0.12.1
                 with:
                     access_token: ${{ github.token }}
 
             -   name: Checkout repository
-                uses: actions/checkout@v3
+                uses: actions/checkout@v4
 
             -   name: Use Node.js ${{ matrix.node-version }}
-                uses: actions/setup-node@v3
+                uses: actions/setup-node@v4
                 with:
                     node-version: ${{ matrix.node-version }}
-                    cache: 'npm'
-                    cache-dependency-path: 'package-lock.json'
 
-            -   uses: microsoft/playwright-github-action@v1
+            -   name: Enable corepack
+                run: |
+                    corepack enable
+                    corepack prepare yarn@stable --activate
+
+            -   name: Activate cache for Node.js ${{ matrix.node-version }}
+                uses: actions/setup-node@v4
+                with:
+                    cache: 'yarn'
 
             -   name: Turbo cache
                 id: turbo-cache
-                uses: actions/cache@v3
+                uses: actions/cache@v4
                 with:
                     path: .turbo
-                    key: turbo-${{ github.job }}-${{ github.ref_name }}-${{ github.sha }}
+                    key: turbo-${{ github.job }}-${{ matrix.node-version }}-${{ github.ref_name }}-${{ github.sha }}
                     restore-keys: |
-                        turbo-${{ github.job }}-${{ github.ref_name }}-
+                        turbo-${{ github.job }}-${{ matrix.node-version }}-${{ github.ref_name }}-
 
             -   name: Install Dependencies
-                run: npm ci
+                run: |
+                    yarn
+                    yarn playwright install --with-deps
+                env:
+                    YARN_IGNORE_NODE: 1
 
             -   name: Build
-                run: npm run ci:build
+                run: yarn ci:build
+                env:
+                    YARN_IGNORE_NODE: 1
+
+            -   name: Test TS
+                run: yarn tsc-check-tests
+                env:
+                    YARN_IGNORE_NODE: 1
 
             -   name: Tests
-                run: npm test
+                run: yarn test
+                env:
+                    YARN_IGNORE_NODE: 1
 
     docs:
         name: Docs build
-        if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
-        runs-on: ubuntu-latest
+        if: (!contains(github.event.head_commit.message, '[skip ci]') && github.ref != 'refs/heads/master')
+        runs-on: ubuntu-22.04
         steps:
             -   name: Checkout Source code
-                uses: actions/checkout@v3
+                uses: actions/checkout@v4
 
-            -   name: Use Node.js 18
-                uses: actions/setup-node@v3
+            -   name: Use Node.js 20
+                uses: actions/setup-node@v4
                 with:
-                    node-version: 18
-                    cache: 'npm'
-                    cache-dependency-path: 'package-lock.json'
+                    node-version: 20
+
+            -   name: Enable corepack
+                run: |
+                    corepack enable
+                    corepack prepare yarn@stable --activate
+
+            -   name: Activate cache for Node.js 20
+                uses: actions/setup-node@v4
+                with:
+                    cache: 'yarn'
 
             -   name: Turbo cache
                 id: turbo-cache
-                uses: actions/cache@v3
+                uses: actions/cache@v4
                 with:
                     path: .turbo
                     key: turbo-${{ github.job }}-${{ github.ref_name }}-${{ github.sha }}
@@ -82,32 +113,42 @@ jobs:
                         turbo-${{ github.job }}-${{ github.ref_name }}-
 
             -   name: Install Dependencies
-                run: npm ci
+                run: yarn
 
             -   name: Build & deploy docs
                 run: |
                     cd website
-                    npm ci
-                    npm run build
+                    yarn
+                    yarn build
+                env:
+                    APIFY_SIGNING_TOKEN: ${{ secrets.APIFY_SIGNING_TOKEN }}
 
     lint:
         name: Lint
-        runs-on: ubuntu-latest
+        runs-on: ubuntu-22.04
 
         steps:
             -   name: Checkout repository
-                uses: actions/checkout@v3
+                uses: actions/checkout@v4
 
-            -   name: Use Node.js 18
-                uses: actions/setup-node@v3
+            -   name: Use Node.js 20
+                uses: actions/setup-node@v4
                 with:
-                    node-version: 18
-                    cache: 'npm'
-                    cache-dependency-path: 'package-lock.json'
+                    node-version: 20
+
+            -   name: Enable corepack
+                run: |
+                    corepack enable
+                    corepack prepare yarn@stable --activate
+
+            -   name: Activate cache for Node.js 20
+                uses: actions/setup-node@v4
+                with:
+                    cache: 'yarn'
 
             -   name: Turbo cache
                 id: turbo-cache
-                uses: actions/cache@v3
+                uses: actions/cache@v4
                 with:
                     path: .turbo
                     key: turbo-${{ github.job }}-${{ github.ref_name }}-${{ github.sha }}
@@ -115,93 +156,94 @@ jobs:
                         turbo-${{ github.job }}-${{ github.ref_name }}-
 
             -   name: Install Dependencies
-                run: npm ci
+                run: yarn
 
             -   name: ESLint
-                run: npm run lint
+                run: yarn lint
+
+            -   name: Biome format
+                run: yarn format:check
 
     release_next:
         name: Release @next
-        if: "github.event_name == 'push' && contains(github.event.ref, 'master') && (!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, 'docs:'))"
+        if: github.event_name == 'push' && contains(github.event.ref, 'master') && (!contains(github.event.head_commit.message, '[skip ci]') && !contains(github.event.head_commit.message, 'docs:'))
         needs: build_and_test
-        runs-on: ubuntu-latest
+        runs-on: ubuntu-22.04
 
         steps:
-          - name: Checkout repository
-            uses: actions/checkout@v3
+            -   name: Checkout repository
+                uses: actions/checkout@v4
 
-          - name: Use Node.js 18
-            uses: actions/setup-node@v3
-            with:
-              node-version: 18
-              cache: 'npm'
-              cache-dependency-path: 'package-lock.json'
+            -   name: Use Node.js 20
+                uses: actions/setup-node@v4
+                with:
+                    node-version: 20
 
-          - name: Turbo cache
-            id: turbo-cache
-            uses: actions/cache@v3
-            with:
-              path: .turbo
-              key: turbo-${{ github.job }}-${{ github.ref_name }}-${{ github.sha }}
-              restore-keys: |
-                turbo-${{ github.job }}-${{ github.ref_name }}-
+            -   name: Enable corepack
+                run: |
+                    corepack enable
+                    corepack prepare yarn@stable --activate
 
-          - name: Install Dependencies
-            run: npm ci
+            -   name: Activate cache for Node.js 20
+                uses: actions/setup-node@v4
+                with:
+                    cache: 'yarn'
 
-          - name: Build
-            run: npm run ci:build
+            -   name: Turbo cache
+                id: turbo-cache
+                uses: actions/cache@v4
+                with:
+                    path: .turbo
+                    key: turbo-${{ github.job }}-${{ github.ref_name }}-${{ github.sha }}
+                    restore-keys: |
+                        turbo-${{ github.job }}-${{ github.ref_name }}-
 
-          - name: Generate changed packages list
-            id: changed-packages
-            run: |
-              echo "changed_packages=$(node ./node_modules/.bin/lerna changed -p | wc -l | xargs)" >> $GITHUB_OUTPUT
+            -   name: Install Dependencies
+                run: yarn
 
-          - name: Report nothing to release
-            if: steps.changed-packages.outputs.changed_packages == '0'
-            run: echo "Nothing to release"
+            -   name: Build
+                run: yarn ci:build
 
-          - name: Release @next
-            if: steps.changed-packages.outputs.changed_packages != '0'
-            run: |
-              git config --global user.name 'Apify Release Bot'
-              git config --global user.email 'noreply@apify.com'
-              npx turbo copy --force -- -- --canary --preid=beta
-              git commit -am "chore: bump canary versions [skip ci]"
+            -   name: Generate changed packages list
+                id: changed-packages
+                run: |
+                    echo "changed_packages=$(node ./node_modules/.bin/lerna changed -p | wc -l | xargs)" >> $GITHUB_OUTPUT
 
-              echo "access=public" > .npmrc
-              echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> .npmrc
-              npm run publish:next -- --yes --no-verify-access
-            env:
-              NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-              GIT_USER: "noreply@apify.com:${{ secrets.GH_TOKEN }}"
-              GH_TOKEN: ${{ secrets.GH_TOKEN }}
+            -   name: Report nothing to release
+                if: steps.changed-packages.outputs.changed_packages == '0'
+                run: echo "Nothing to release"
 
-          - name: Collect versions for Docker images
-            id:  versions
-            run: |
-              crawlee=`node -p "require('./packages/crawlee/package.json').version"`
-              echo "crawlee=$crawlee" >> $GITHUB_OUTPUT
-              apify=`node -p "require('./package.json').devDependencies.apify"`
-              echo "apify=$apify" >> $GITHUB_OUTPUT
-              puppeteer=`node -p "require('./package.json').devDependencies.puppeteer"`
-              echo "puppeteer=$puppeteer" >> $GITHUB_OUTPUT
-              playwright=`node -p "require('./package.json').devDependencies.playwright"`
-              echo "playwright=$playwright" >> $GITHUB_OUTPUT
+            -   name: Release @next
+                if: steps.changed-packages.outputs.changed_packages != '0'
+                run: |
+                    git config --global user.name 'Apify Release Bot'
+                    git config --global user.email 'noreply@apify.com'
+                    yarn turbo copy --force -- --canary --preid=beta
+                    git commit -am "chore: bump canary versions [skip ci]"
 
-          - name: Trigger Docker image builds
-            uses: peter-evans/repository-dispatch@v2
-            # Trigger next images only if we have something new pushed
-            if: steps.changed-packages.outputs.changed_packages != '0'
-            with:
-              token: ${{ secrets.TRIGGER_DOCKER_IMAGE_BUILD_TOKEN }}
-              repository: apify/apify-actor-docker
-              event-type: build-node-images
-              client-payload: >
-                {
-                  "release_tag": "next",
-                  "apify_version": "${{ steps.versions.outputs.apify }}",
-                  "crawlee_version": "${{ steps.versions.outputs.crawlee }}",
-                  "puppeteer_version": "${{ steps.versions.outputs.puppeteer }}",
-                  "playwright_version": "${{ steps.versions.outputs.playwright }}"
-                }
+                    echo "access=public" > .npmrc
+                    echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> .npmrc
+                    yarn publish:next --yes --no-verify-access
+                env:
+                    NPM_TOKEN: ${{ secrets.APIFY_SERVICE_ACCOUNT_NPM_TOKEN }}
+                    GIT_USER: 'noreply@apify.com:${{ secrets.APIFY_SERVICE_ACCOUNT_GITHUB_TOKEN }}'
+                    GH_TOKEN: ${{ secrets.APIFY_SERVICE_ACCOUNT_GITHUB_TOKEN }}
+
+            -   name: Collect versions for Docker images
+                id: versions
+                run: |
+                    crawlee=`node -p "require('./packages/crawlee/package.json').version"`
+                    echo "crawlee=$crawlee" >> $GITHUB_OUTPUT
+
+            -   name: Trigger Docker image builds
+                uses: peter-evans/repository-dispatch@v3
+                # Trigger next images only if we have something new pushed
+                if: steps.changed-packages.outputs.changed_packages != '0'
+                with:
+                    token: ${{ secrets.APIFY_SERVICE_ACCOUNT_GITHUB_TOKEN }}
+                    repository: apify/crawlee
+                    event-type: crawlee-docker-image-bump
+                    client-payload: >
+                        {
+                          "crawlee_version": "${{ steps.versions.outputs.crawlee }}"
+                        }

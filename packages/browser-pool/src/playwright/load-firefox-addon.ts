@@ -1,7 +1,7 @@
 import { Buffer } from 'buffer';
 import net from 'net';
 
-export const loadFirefoxAddon = (port: number, host: string, addonPath: string) => {
+export const loadFirefoxAddon = async (port: number, host: string, addonPath: string) => {
     return new Promise<boolean>((resolve) => {
         const socket = net.connect({
             port,
@@ -51,6 +51,7 @@ export const loadFirefoxAddon = (port: number, host: string, addonPath: string) 
         let remainingBytes = 0;
 
         socket.on('data', (data) => {
+            // eslint-disable-next-line no-constant-condition
             while (true) {
                 if (remainingBytes === 0) {
                     const index = data.indexOf(':');

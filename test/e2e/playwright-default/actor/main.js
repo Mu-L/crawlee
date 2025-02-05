@@ -1,17 +1,21 @@
 import { Actor } from 'apify';
 import { Dataset, PlaywrightCrawler } from '@crawlee/playwright';
-import { ApifyStorageLocal } from '@apify/storage-local';
 
 const mainOptions = {
     exit: Actor.isAtHome(),
-    storage: process.env.STORAGE_IMPLEMENTATION === 'LOCAL' ? new ApifyStorageLocal() : undefined,
+    storage:
+        process.env.STORAGE_IMPLEMENTATION === 'LOCAL'
+            ? new (await import('@apify/storage-local')).ApifyStorageLocal()
+            : undefined,
 };
 
 await Actor.main(async () => {
     const crawler = new PlaywrightCrawler({
-        preNavigationHooks: [(_ctx, goToOptions) => {
-            goToOptions.waitUntil = 'networkidle';
-        }],
+        preNavigationHooks: [
+            (_ctx, goToOptions) => {
+                goToOptions.waitUntil = 'networkidle';
+            },
+        ],
         async requestHandler({ page, enqueueLinks, request }) {
             const { url } = request;
             const pageTitle = await page.title();

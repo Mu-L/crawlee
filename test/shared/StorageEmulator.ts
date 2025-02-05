@@ -1,4 +1,5 @@
 import { rm } from 'node:fs/promises';
+
 import { StorageManager } from '@crawlee/core';
 
 export abstract class StorageEmulator {
@@ -9,7 +10,7 @@ export abstract class StorageEmulator {
     }
 
     async destroy() {
-        const promises = this.localStorageDirectories.map((dir) => {
+        const promises = this.localStorageDirectories.map(async (dir) => {
             return rm(dir, { force: true, recursive: true });
         });
 

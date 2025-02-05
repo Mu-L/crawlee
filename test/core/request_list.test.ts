@@ -1,13 +1,22 @@
 import log from '@apify/log';
-import { Configuration, deserializeArray, EventType, KeyValueStore, ProxyConfiguration, Request, RequestList } from '@crawlee/core';
+import {
+    Configuration,
+    deserializeArray,
+    EventType,
+    KeyValueStore,
+    ProxyConfiguration,
+    Request,
+    RequestList,
+} from '@crawlee/core';
 import { sleep } from '@crawlee/utils';
-import { gotScraping } from 'got-scraping';
+import type { gotScraping } from '@crawlee/utils';
 import { MemoryStorageEmulator } from 'test/shared/MemoryStorageEmulator';
+import { beforeAll, type MockedFunction } from 'vitest';
 
 /**
  * Stand-in for underscore.js shuffle (weird, but how else?)
  */
-function shuffle(array: unknown[]) : unknown[] {
+function shuffle(array: unknown[]): unknown[] {
     const out = [...array];
     for (let i = out.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -16,24 +25,18 @@ function shuffle(array: unknown[]) : unknown[] {
     return out;
 }
 
-jest.mock('got-scraping', () => {
-    const original: typeof import('got-scraping') = jest.requireActual('got-scraping');
+vitest.mock('@crawlee/utils/src/internals/gotScraping', async () => {
     return {
-        ...original,
-        gotScraping: jest.fn(original.gotScraping),
+        gotScraping: vitest.fn(),
     };
 });
 
-const gotScrapingSpy = gotScraping as jest.MockedFunction<typeof gotScraping>;
-const originalGotScraping = gotScrapingSpy.getMockImplementation()!;
+let gotScrapingSpy: MockedFunction<typeof gotScraping>;
 
-afterEach(() => {
-    gotScrapingSpy.mockReset();
-    gotScrapingSpy.mockImplementation(originalGotScraping);
-});
-
-afterAll(() => {
-    jest.unmock('got-scraping');
+beforeAll(async () => {
+    // @ts-ignore for some reason, this fails when the project is not built :/
+    const { gotScraping } = await import('@crawlee/utils');
+    gotScrapingSpy = vitest.mocked(gotScraping);
 });
 
 describe('RequestList', () => {
@@ -48,7 +51,7 @@ describe('RequestList', () => {
 
     beforeEach(async () => {
         await emulator.init();
-        jest.restoreAllMocks();
+        vitest.restoreAllMocks();
     });
 
     afterAll(async () => {
@@ -66,12 +69,12 @@ describe('RequestList', () => {
 
         const req = await requestList.fetchNextRequest();
 
-        expect(req.url).toBe('https://example.com/1');
+        expect(req!.url).toBe('https://example.com/1');
         expect(await requestList.isEmpty()).toBe(true);
         expect(await requestList.isFinished()).toBe(false);
         expect(await requestList.fetchNextRequest()).toBe(null);
 
-        await requestList.markRequestHandled(req);
+        await requestList.markRequestHandled(req!);
 
         expect(await requestList.isEmpty()).toBe(true);
         expect(await requestList.isFinished()).toBe(true);
@@ -122,10 +125,10 @@ describe('RequestList', () => {
         const r5 = await originalList.fetchNextRequest(); // 5
         await originalList.fetchNextRequest(); // 6
 
-        await originalList.markRequestHandled(r1);
-        await originalList.markRequestHandled(r2);
-        await originalList.markRequestHandled(r4);
-        await originalList.reclaimRequest(r5);
+        await originalList.markRequestHandled(r1!);
+        await originalList.markRequestHandled(r2!);
+        await originalList.markRequestHandled(r4!);
+        await originalList.reclaimRequest(r5!);
 
         const newList = await RequestList.open({
             sources: sourcesCopy,
@@ -133,25 +136,36 @@ describe('RequestList', () => {
         });
 
         expect(await newList.isEmpty()).toBe(false);
-        expect((await newList.fetchNextRequest()).url).toBe('https://example.com/3');
-        expect((await newList.fetchNextRequest()).url).toBe('https://example.com/5');
-        expect((await newList.fetchNextRequest()).url).toBe('https://example.com/6');
-        expect((await newList.fetchNextRequest()).url).toBe('https://example.com/7');
-        expect((await newList.fetchNextRequest()).url).toBe('https://example.com/8');
+        expect((await newList.fetchNextRequest())!.url).toBe('https://example.com/3');
+        expect((await newList.fetchNextRequest())!.url).toBe('https://example.com/5');
+        expect((await newList.fetchNextRequest())!.url).toBe('https://example.com/6');
+        expect((await newList.fetchNextRequest())!.url).toBe('https://example.com/7');
+        expect((await newList.fetchNextRequest())!.url).toBe('https://example.com/8');
         expect(await newList.isEmpty()).toBe(true);
     });
 
+    test('`RequestList` is `for .. await` iterable', async () => {
+        const sources = [
+            'https://example.com/1',
+            'https://example.com/2',
+            'https://example.com/3',
+            'https://example.com/4',
+            'https://example.com/5',
+            'https://example.com/6',
+            'https://example.com/7',
+            'https://example.com/8',
+        ];
+        const requestList = await RequestList.open(null, sources);
+
+        for await (const request of requestList) {
+            expect(request?.url).toBe(sources.shift());
+        }
+    });
+
     test('should correctly load list from hosted files in correct order', async () => {
-        const spy = jest.spyOn(RequestList.prototype as any, '_downloadListOfUrls');
-        const list1 = [
-            'https://example.com',
-            'https://google.com',
-            'https://wired.com',
-        ];
-        const list2 = [
-            'https://another.com',
-            'https://page.com',
-        ];
+        const spy = vitest.spyOn(RequestList.prototype as any, '_downloadListOfUrls');
+        const list1 = ['https://example.com', 'https://google.com', 'https://wired.com'];
+        const list2 = ['https://another.com', 'https://page.com'];
         spy.mockImplementationOnce(() => new Promise((resolve) => setTimeout(resolve(list1) as any, 100)) as any);
         spy.mockResolvedValueOnce(list2);
 
@@ -171,7 +185,6 @@ describe('RequestList', () => {
         expect(spy).toBeCalledTimes(2);
         expect(spy).toBeCalledWith({ url: 'http://example.com/list-1', urlRegExp: undefined });
         expect(spy).toBeCalledWith({ url: 'http://example.com/list-2', urlRegExp: undefined });
-        spy.mockRestore();
     });
 
     test('should use regex parameter to parse urls', async () => {
@@ -194,15 +207,10 @@ describe('RequestList', () => {
         expect(await requestList.fetchNextRequest()).toMatchObject({ method: 'GET', url: listArr[1] });
 
         expect(gotScrapingSpy).toBeCalledWith({ url: 'http://example.com/list-1', encoding: 'utf8' });
-        gotScrapingSpy.mockRestore();
     });
 
     test('should fix gdoc sharing url in `requestsFromUrl` automatically (GH issue #639)', async () => {
-        const list = [
-            'https://example.com',
-            'https://google.com',
-            'https://wired.com',
-        ];
+        const list = ['https://example.com', 'https://google.com', 'https://wired.com'];
         const wrongUrls = [
             'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU',
             'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/',
@@ -211,7 +219,8 @@ describe('RequestList', () => {
             'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/?q=blablabla',
             'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/edit#gid=0',
         ];
-        const correctUrl = 'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/gviz/tq?tqx=out:csv';
+        const correctUrl =
+            'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/gviz/tq?tqx=out:csv';
 
         gotScrapingSpy.mockResolvedValue({ body: JSON.stringify(list) } as any);
 
@@ -224,11 +233,10 @@ describe('RequestList', () => {
         expect(await requestList.fetchNextRequest()).toMatchObject({ method: 'GET', url: list[2] });
 
         expect(gotScrapingSpy).toBeCalledWith({ url: correctUrl, encoding: 'utf8' });
-        gotScrapingSpy.mockRestore();
     });
 
     test('should handle requestsFromUrl with no URLs', async () => {
-        const spy = jest.spyOn(RequestList.prototype as any, '_downloadListOfUrls');
+        const spy = vitest.spyOn(RequestList.prototype as any, '_downloadListOfUrls');
         spy.mockResolvedValueOnce([]);
 
         const requestList = await RequestList.open({
@@ -244,16 +252,12 @@ describe('RequestList', () => {
 
         expect(spy).toBeCalledTimes(1);
         expect(spy).toBeCalledWith({ url: 'http://example.com/list-1', urlRegExp: undefined });
-        spy.mockRestore();
     });
 
     test('should use the defined proxy server when using `requestsFromUrl`', async () => {
-        const proxyUrls = [
-            'http://proxyurl.usedforthe.download',
-            'http://another.proxy.url',
-        ];
+        const proxyUrls = ['http://proxyurl.usedforthe.download', 'http://another.proxy.url'];
 
-        const spy = jest.spyOn(RequestList.prototype as any, '_downloadListOfUrls');
+        const spy = vitest.spyOn(RequestList.prototype as any, '_downloadListOfUrls');
         spy.mockResolvedValue([]);
 
         const proxyConfiguration = new ProxyConfiguration({
@@ -270,8 +274,6 @@ describe('RequestList', () => {
         });
 
         expect(spy).not.toBeCalledWith(expect.not.objectContaining({ proxyUrl: expect.any(String) }));
-
-        spy.mockRestore();
     });
 
     test('should correctly handle reclaimed pages', async () => {
@@ -296,11 +298,11 @@ describe('RequestList', () => {
         const request4 = await requestList.fetchNextRequest();
         const request5 = await requestList.fetchNextRequest();
 
-        expect(request1.url).toBe('https://example.com/1');
-        expect(request2.url).toBe('https://example.com/2');
-        expect(request3.url).toBe('https://example.com/3');
-        expect(request4.url).toBe('https://example.com/4');
-        expect(request5.url).toBe('https://example.com/5');
+        expect(request1!.url).toBe('https://example.com/1');
+        expect(request2!.url).toBe('https://example.com/2');
+        expect(request3!.url).toBe('https://example.com/3');
+        expect(request4!.url).toBe('https://example.com/4');
+        expect(request5!.url).toBe('https://example.com/5');
         expect(requestList.getState()).toEqual({
             inProgress: [
                 'https://example.com/1',
@@ -322,17 +324,13 @@ describe('RequestList', () => {
         // Reclaim 3rd 4th
         //
 
-        await requestList.markRequestHandled(request1);
-        await requestList.markRequestHandled(request2);
-        await requestList.reclaimRequest(request3);
-        await requestList.reclaimRequest(request4);
+        await requestList.markRequestHandled(request1!);
+        await requestList.markRequestHandled(request2!);
+        await requestList.reclaimRequest(request3!);
+        await requestList.reclaimRequest(request4!);
 
         expect(requestList.getState()).toEqual({
-            inProgress: [
-                'https://example.com/3',
-                'https://example.com/4',
-                'https://example.com/5',
-            ],
+            inProgress: ['https://example.com/3', 'https://example.com/4', 'https://example.com/5'],
             nextIndex: 5,
             nextUniqueKey: 'https://example.com/6',
         });
@@ -344,13 +342,10 @@ describe('RequestList', () => {
         // Mark 5th handled
         //
 
-        await requestList.markRequestHandled(request5);
+        await requestList.markRequestHandled(request5!);
 
         expect(requestList.getState()).toEqual({
-            inProgress: [
-                'https://example.com/3',
-                'https://example.com/4',
-            ],
+            inProgress: ['https://example.com/3', 'https://example.com/4'],
             nextIndex: 5,
             nextUniqueKey: 'https://example.com/6',
         });
@@ -364,15 +359,13 @@ describe('RequestList', () => {
         //
 
         const reclaimed3 = await requestList.fetchNextRequest();
-        expect(reclaimed3.url).toBe('https://example.com/3');
+        expect(reclaimed3!.url).toBe('https://example.com/3');
         const reclaimed4 = await requestList.fetchNextRequest();
-        expect(reclaimed4.url).toBe('https://example.com/4');
-        await requestList.markRequestHandled(request4);
+        expect(reclaimed4!.url).toBe('https://example.com/4');
+        await requestList.markRequestHandled(request4!);
 
         expect(requestList.getState()).toEqual({
-            inProgress: [
-                'https://example.com/3',
-            ],
+            inProgress: ['https://example.com/3'],
             nextIndex: 5,
             nextUniqueKey: 'https://example.com/6',
         });
@@ -384,7 +377,7 @@ describe('RequestList', () => {
         // Mark 3rd handled
         //
 
-        await requestList.markRequestHandled(request3);
+        await requestList.markRequestHandled(request3!);
 
         expect(requestList.getState()).toEqual({
             inProgress: [],
@@ -401,12 +394,10 @@ describe('RequestList', () => {
 
         const request6 = await requestList.fetchNextRequest();
 
-        expect(request6.url).toBe('https://example.com/6');
+        expect(request6!.url).toBe('https://example.com/6');
         expect(await requestList.fetchNextRequest()).toBe(null);
         expect(requestList.getState()).toEqual({
-            inProgress: [
-                'https://example.com/6',
-            ],
+            inProgress: ['https://example.com/6'],
             nextIndex: 6,
             nextUniqueKey: null,
         });
@@ -418,12 +409,10 @@ describe('RequestList', () => {
         // Reclaim 6th
         //
 
-        await requestList.reclaimRequest(request6);
+        await requestList.reclaimRequest(request6!);
 
         expect(requestList.getState()).toEqual({
-            inProgress: [
-                'https://example.com/6',
-            ],
+            inProgress: ['https://example.com/6'],
             nextIndex: 6,
             nextUniqueKey: null,
         });
@@ -437,11 +426,9 @@ describe('RequestList', () => {
 
         const reclaimed6 = await requestList.fetchNextRequest();
 
-        expect(reclaimed6.url).toBe('https://example.com/6');
+        expect(reclaimed6!.url).toBe('https://example.com/6');
         expect(requestList.getState()).toEqual({
-            inProgress: [
-                'https://example.com/6',
-            ],
+            inProgress: ['https://example.com/6'],
             nextIndex: 6,
             nextUniqueKey: null,
         });
@@ -453,7 +440,7 @@ describe('RequestList', () => {
         // Mark 6th handled
         //
 
-        await requestList.markRequestHandled(reclaimed6);
+        await requestList.markRequestHandled(reclaimed6!);
 
         expect(requestList.getState()).toEqual({
             inProgress: [],
@@ -467,8 +454,8 @@ describe('RequestList', () => {
 
     test('should correctly persist its state when persistStateKey is set', async () => {
         const PERSIST_STATE_KEY = 'some-key';
-        const getValueSpy = jest.spyOn(KeyValueStore.prototype, 'getValue');
-        const setValueSpy = jest.spyOn(KeyValueStore.prototype, 'setValue');
+        const getValueSpy = vitest.spyOn(KeyValueStore.prototype, 'getValue');
+        const setValueSpy = vitest.spyOn(KeyValueStore.prototype, 'setValue');
 
         getValueSpy.mockResolvedValueOnce(null);
 
@@ -498,7 +485,7 @@ describe('RequestList', () => {
         // Do some other changes and persist it again.
         const request2 = await requestList.fetchNextRequest();
         expect(requestList.isStatePersisted).toBe(false);
-        await requestList.markRequestHandled(request2);
+        await requestList.markRequestHandled(request2!);
         expect(requestList.isStatePersisted).toBe(false);
         setValueSpy.mockResolvedValueOnce();
         events.emit(EventType.PERSIST_STATE);
@@ -506,7 +493,7 @@ describe('RequestList', () => {
         expect(requestList.isStatePersisted).toBe(true);
 
         // Reclaim event doesn't change the state.
-        await requestList.reclaimRequest(request1);
+        await requestList.reclaimRequest(request1!);
         expect(requestList.isStatePersisted).toBe(true);
 
         // Now initiate new request list from saved state and check that it's same as state
@@ -518,8 +505,8 @@ describe('RequestList', () => {
 
     test('should correctly persist its sources when persistRequestsKey is set', async () => {
         const PERSIST_REQUESTS_KEY = 'some-key';
-        const getValueSpy = jest.spyOn(KeyValueStore.prototype, 'getValue');
-        const setValueSpy = jest.spyOn(KeyValueStore.prototype, 'setValue');
+        const getValueSpy = vitest.spyOn(KeyValueStore.prototype, 'getValue');
+        const setValueSpy = vitest.spyOn(KeyValueStore.prototype, 'setValue');
 
         let persistedRequests;
 
@@ -544,11 +531,7 @@ describe('RequestList', () => {
         expect(requestList.areRequestsPersisted).toBe(true);
 
         const opts2 = {
-            sources: [
-                { url: 'https://test.com/1' },
-                { url: 'https://test.com/2' },
-                { url: 'https://test.com/3' },
-            ],
+            sources: [{ url: 'https://test.com/1' }, { url: 'https://test.com/2' }, { url: 'https://test.com/3' }],
             persistRequestsKey: PERSIST_REQUESTS_KEY,
         };
 
@@ -561,10 +544,10 @@ describe('RequestList', () => {
 
     test('should correctly persist sources from requestsFromUrl if persistRequestsKey is set', async () => {
         const PERSIST_REQUESTS_KEY = 'some-key';
-        const getValueSpy = jest.spyOn(KeyValueStore.prototype, 'getValue');
-        const setValueSpy = jest.spyOn(KeyValueStore.prototype, 'setValue');
-        const spy = jest.spyOn(RequestList.prototype as any, '_downloadListOfUrls');
-        let persistedRequests;
+        const getValueSpy = vitest.spyOn(KeyValueStore.prototype, 'getValue');
+        const setValueSpy = vitest.spyOn(KeyValueStore.prototype, 'setValue');
+        const spy = vitest.spyOn(RequestList.prototype as any, '_downloadListOfUrls');
+        let persistedRequests: any;
 
         const opts = {
             sources: [
@@ -592,7 +575,6 @@ describe('RequestList', () => {
 
         expect(spy).toBeCalledTimes(1);
         expect(spy).toBeCalledWith({ url: 'http://example.com/list-urls.txt', urlRegExp: undefined });
-        spy.mockRestore();
     });
 
     test('handles correctly inconsistent inProgress fields in state', async () => {
@@ -608,11 +590,7 @@ describe('RequestList', () => {
         const state = {
             nextIndex: 2,
             nextUniqueKey: 'https://www.anychart.com',
-            inProgress: [
-                'https://www.ams360.com',
-                'https://www.anybus.com',
-                'https://www.anychart.com',
-            ],
+            inProgress: ['https://www.ams360.com', 'https://www.anybus.com', 'https://www.anychart.com'],
         };
 
         const requestList = await RequestList.open({
@@ -669,13 +647,13 @@ describe('RequestList', () => {
         const req3 = await requestList.fetchNextRequest();
         expect(requestList.handledCount()).toBe(0);
 
-        await requestList.markRequestHandled(req2);
+        await requestList.markRequestHandled(req2!);
         expect(requestList.handledCount()).toBe(1);
 
-        await requestList.markRequestHandled(req3);
+        await requestList.markRequestHandled(req3!);
         expect(requestList.handledCount()).toBe(2);
 
-        await requestList.reclaimRequest(req1);
+        await requestList.reclaimRequest(req1!);
         expect(requestList.handledCount()).toBe(2);
     });
 
@@ -696,7 +674,7 @@ describe('RequestList', () => {
         expect(requestList.length()).toBe(4);
 
         log.setLevel(log.LEVELS.INFO);
-        const warnSpy = jest.spyOn(console, 'warn').mockImplementation();
+        const warnSpy = vitest.spyOn(console, 'warn').mockImplementation(() => {});
 
         requestList = await RequestList.open({
             sources: sourcesCopy.concat([
@@ -712,14 +690,13 @@ describe('RequestList', () => {
         expect(warnSpy).toBeCalled();
         expect(warnSpy.mock.calls[0][0]).toMatch(`Check your sources' unique keys.`);
 
-        warnSpy.mockRestore();
         log.setLevel(log.LEVELS.ERROR);
     });
 
     describe('Apify.RequestList.open()', () => {
         test('should work', async () => {
-            const getValueSpy = jest.spyOn(KeyValueStore.prototype, 'getValue');
-            const setValueSpy = jest.spyOn(KeyValueStore.prototype, 'setValue');
+            const getValueSpy = vitest.spyOn(KeyValueStore.prototype, 'getValue');
+            const setValueSpy = vitest.spyOn(KeyValueStore.prototype, 'setValue');
 
             const name = 'xxx';
             const SDK_KEY = `SDK_${name}`;
@@ -741,13 +718,13 @@ describe('RequestList', () => {
         });
 
         test('should work with string sources', async () => {
-            const getValueSpy = jest.spyOn(KeyValueStore.prototype, 'getValue');
-            const setValueSpy = jest.spyOn(KeyValueStore.prototype, 'setValue');
+            const getValueSpy = vitest.spyOn(KeyValueStore.prototype, 'getValue');
+            const setValueSpy = vitest.spyOn(KeyValueStore.prototype, 'setValue');
 
             const name = 'xxx';
             const SDK_KEY = `SDK_${name}`;
             const sources = ['https://example.com'];
-            const requests = sources.map((url) => new Request({ url }));
+            const requests = sources.map((url) => ({ url, uniqueKey: url }));
 
             const rl = await RequestList.open(name, sources);
             expect(rl).toBeInstanceOf(RequestList);
@@ -764,14 +741,14 @@ describe('RequestList', () => {
         });
 
         test('should correctly pass options', async () => {
-            const getValueSpy = jest.spyOn(KeyValueStore.prototype, 'getValue');
-            const setValueSpy = jest.spyOn(KeyValueStore.prototype, 'setValue');
+            const getValueSpy = vitest.spyOn(KeyValueStore.prototype, 'getValue');
+            const setValueSpy = vitest.spyOn(KeyValueStore.prototype, 'setValue');
 
             const name = 'xxx';
             const SDK_KEY = `SDK_${name}`;
             let counter = 0;
             const sources = [{ url: 'https://example.com' }];
-            const requests = sources.map(({ url }) => new Request({ url, uniqueKey: `${url}-${counter++}` }));
+            const requests = sources.map(({ url }) => ({ url, uniqueKey: `${url}-${counter++}` }));
             const options = {
                 keepDuplicateUrls: true,
                 persistStateKey: 'yyy',
@@ -794,12 +771,12 @@ describe('RequestList', () => {
         });
 
         test('should work with null name', async () => {
-            const getValueSpy = jest.spyOn(KeyValueStore.prototype, 'getValue');
-            const setValueSpy = jest.spyOn(KeyValueStore.prototype, 'setValue');
+            const getValueSpy = vitest.spyOn(KeyValueStore.prototype, 'getValue');
+            const setValueSpy = vitest.spyOn(KeyValueStore.prototype, 'setValue');
 
-            const name: string = null;
+            const name: string | null = null;
             const sources = [{ url: 'https://example.com' }];
-            const requests = sources.map(({ url }) => new Request({ url }));
+            const requests = sources.map(({ url }) => ({ url, uniqueKey: url }));
 
             const rl = await RequestList.open(name, sources);
             expect(rl).toBeInstanceOf(RequestList);
@@ -816,12 +793,7 @@ describe('RequestList', () => {
         });
 
         test('should throw on invalid parameters', async () => {
-            const args = [
-                [],
-                ['x', {}],
-                ['x', 6, {}],
-                ['x', [], []],
-            ] as const;
+            const args = [[], ['x', {}], ['x', 6, {}], ['x', [], []]] as const;
             for (const arg of args) {
                 try {
                     // @ts-ignore
@@ -833,9 +805,10 @@ describe('RequestList', () => {
                     if (e.message.match('argument to be of type `string`')) {
                         expect(e.message).toMatch('received type `undefined`');
                     } else if (e.message.match('argument to be of type `array`')) {
-                        const isMatched = e.message.match('received type `Object`')
-                            || e.message.match('received type `number`')
-                            || e.message.match('received type `undefined`');
+                        const isMatched =
+                            e.message.match('received type `Object`') ||
+                            e.message.match('received type `number`') ||
+                            e.message.match('received type `undefined`');
                         expect(isMatched).toBeTruthy();
                     } else if (e.message.match('argument to be of type `null`')) {
                         expect(e.message).toMatch('received type `undefined`');

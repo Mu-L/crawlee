@@ -1,17 +1,22 @@
 import type { Dictionary } from '@crawlee/types';
-import type { CrawlingContext } from './crawlers/crawler_commons';
-import type { Awaitable } from './typedefs';
-import type { Request } from './request';
-import type { Except } from './except';
+
+import type { CrawlingContext, LoadedRequest, RestrictedCrawlingContext } from './crawlers/crawler_commons';
 import { MissingRouteError } from './errors';
+import type { Request } from './request';
+import type { Awaitable } from './typedefs';
 
 const defaultRoute = Symbol('default-route');
 
-export interface RouterHandler<Context extends CrawlingContext = CrawlingContext> extends Router<Context> {
+export interface RouterHandler<Context extends Omit<RestrictedCrawlingContext, 'enqueueLinks'> = CrawlingContext>
+    extends Router<Context> {
     (ctx: Context): Awaitable<void>;
 }
 
-type GetUserDataFromRequest<T> = T extends Request<infer Y> ? Y : never;
+export type GetUserDataFromRequest<T> = T extends Request<infer Y> ? Y : never;
+
+export type RouterRoutes<Context, UserData extends Dictionary> = {
+    [label in string | symbol]: (ctx: Omit<Context, 'request'> & { request: Request<UserData> }) => Awaitable<void>;
+};
 
 /**
  * Simple router that works based on request labels. This instance can then serve as a `requestHandler` of your crawler.
@@ -55,6 +60,19 @@ type GetUserDataFromRequest<T> = T extends Request<infer Y> ? Y : never;
  * await crawler.run();
  * ```
  *
+ * For convenience, we can also define the routes right when creating the router:
+ *
+ * ```ts
+ * import { CheerioCrawler, createCheerioRouter } from 'crawlee';
+ * const crawler = new CheerioCrawler({
+ *     requestHandler: createCheerioRouter({
+ *         'label-a': async (ctx) => { ... },
+ *         'label-b': async (ctx) => { ... },
+ *     })},
+ * });
+ * await crawler.run();
+ * ```
+ *
  * Middlewares are also supported via the `router.use` method. There can be multiple
  * middlewares for a single router, they will be executed sequentially in the same
  * order as they were registered.
@@ -63,9 +81,10 @@ type GetUserDataFromRequest<T> = T extends Request<infer Y> ? Y : never;
  * crawler.router.use(async (ctx) => {
  *    ctx.log.info('...');
  * });
+ * ```
  */
-export class Router<Context extends CrawlingContext> {
-    private readonly routes: Map<string | symbol, (ctx: Context) => Awaitable<void>> = new Map();
+export class Router<Context extends Omit<RestrictedCrawlingContext, 'enqueueLinks'>> {
+    private readonly routes: Map<string | symbol, (ctx: any) => Awaitable<void>> = new Map();
     private readonly middlewares: ((ctx: Context) => Awaitable<void>)[] = [];
 
     /**
@@ -79,7 +98,7 @@ export class Router<Context extends CrawlingContext> {
      */
     addHandler<UserData extends Dictionary = GetUserDataFromRequest<Context['request']>>(
         label: string | symbol,
-        handler: (ctx: Except<Context, 'request'> & {request: Request<UserData>}) => Awaitable<void>,
+        handler: (ctx: Omit<Context, 'request'> & { request: LoadedRequest<Request<UserData>> }) => Awaitable<void>,
     ) {
         this.validate(label);
         this.routes.set(label, handler);
@@ -89,7 +108,7 @@ export class Router<Context extends CrawlingContext> {
      * Registers default route handler.
      */
     addDefaultHandler<UserData extends Dictionary = GetUserDataFromRequest<Context['request']>>(
-        handler: (ctx: Except<Context, 'request'> & {request: Request<UserData>}) => Awaitable<void>,
+        handler: (ctx: Omit<Context, 'request'> & { request: LoadedRequest<Request<UserData>> }) => Awaitable<void>,
     ) {
         this.validate(defaultRoute);
         this.routes.set(defaultRoute, handler);
@@ -116,9 +135,9 @@ export class Router<Context extends CrawlingContext> {
         }
 
         throw new MissingRouteError(
-            `Route not found for label '${String(label)}'.`
-            + ' You must set up a route for this label or a default route.'
-            + ' Use `requestHandler`, `router.addHandler` or `router.addDefaultHandler`.',
+            `Route not found for label '${String(label)}'.` +
+                ' You must set up a route for this label or a default route.' +
+                ' Use `requestHandler`, `router.addHandler` or `router.addDefaultHandler`.',
         );
     }
 
@@ -127,9 +146,10 @@ export class Router<Context extends CrawlingContext> {
      */
     private validate(label: string | symbol) {
         if (this.routes.has(label)) {
-            const message = label === defaultRoute
-                ? `Default route is already defined!`
-                : `Route for label '${String(label)}' is already defined!`;
+            const message =
+                label === defaultRoute
+                    ? `Default route is already defined!`
+                    : `Route for label '${String(label)}' is already defined!`;
             throw new Error(message);
         }
     }
@@ -154,7 +174,10 @@ export class Router<Context extends CrawlingContext> {
      * await crawler.run();
      * ```
      */
-    static create<Context extends CrawlingContext = CrawlingContext>(): RouterHandler<Context> {
+    static create<
+        Context extends Omit<RestrictedCrawlingContext, 'enqueueLinks'> = CrawlingContext,
+        UserData extends Dictionary = GetUserDataFromRequest<Context['request']>,
+    >(routes?: RouterRoutes<Context, UserData>): RouterHandler<Context> {
         const router = new Router<Context>();
         const obj = Object.create(Function.prototype);
 
@@ -162,6 +185,10 @@ export class Router<Context extends CrawlingContext> {
         obj.addDefaultHandler = router.addDefaultHandler.bind(router);
         obj.getHandler = router.getHandler.bind(router);
         obj.use = router.use.bind(router);
+
+        for (const [label, handler] of Object.entries(routes ?? {})) {
+            router.addHandler(label, handler);
+        }
 
         const func = async function (context: Context) {
             const { url, loadedUrl, label } = context.request;

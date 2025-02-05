@@ -1,10 +1,12 @@
+import { resolve } from 'node:path';
+
 import type * as storage from '@crawlee/types';
 import { s } from '@sapphire/shapeshift';
-import { resolve } from 'node:path';
+
+import { KeyValueStoreClient } from './key-value-store';
+import { scheduleBackgroundTask } from '../background-handler';
 import { findOrCacheKeyValueStoreByPossibleId } from '../cache-helpers';
 import type { MemoryStorage } from '../index';
-import { sendWorkerMessage } from '../workers/instance';
-import { KeyValueStoreClient } from './key-value-store';
 
 export interface KeyValueStoreCollectionClientOptions {
     baseStorageDirectory: string;
@@ -27,8 +29,8 @@ export class KeyValueStoreCollectionClient implements storage.KeyValueStoreColle
             offset: 0,
             limit: this.client.keyValueStoresHandled.length,
             desc: false,
-            items: this.client.keyValueStoresHandled.map(
-                (store) => store.toKeyValueStoreInfo())
+            items: this.client.keyValueStoresHandled
+                .map((store) => store.toKeyValueStoreInfo())
                 .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()),
         };
     }
@@ -44,13 +46,17 @@ export class KeyValueStoreCollectionClient implements storage.KeyValueStoreColle
             }
         }
 
-        const newStore = new KeyValueStoreClient({ name, baseStorageDirectory: this.keyValueStoresDirectory, client: this.client });
+        const newStore = new KeyValueStoreClient({
+            name,
+            baseStorageDirectory: this.keyValueStoresDirectory,
+            client: this.client,
+        });
         this.client.keyValueStoresHandled.push(newStore);
 
         // Schedule the worker to write to the disk
         const kvStoreInfo = newStore.toKeyValueStoreInfo();
-        // eslint-disable-next-line dot-notation
-        sendWorkerMessage({
+
+        scheduleBackgroundTask({
             action: 'update-metadata',
             entityType: 'keyValueStores',
             entityDirectory: newStore.keyValueStoreDirectory,

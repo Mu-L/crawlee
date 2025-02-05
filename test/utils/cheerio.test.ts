@@ -1,6 +1,7 @@
-import cheerio from 'cheerio';
 import type { CheerioRoot } from '@crawlee/utils';
 import { htmlToText } from '@crawlee/utils';
+import * as cheerio from 'cheerio';
+
 import * as htmlToTextData from '../shared/data/html_to_text_test_data';
 
 const checkHtmlToText = (html: string | CheerioRoot, expectedText: string, hasBody = false) => {
@@ -31,10 +32,12 @@ const checkHtmlToText = (html: string | CheerioRoot, expectedText: string, hasBo
 
 describe('htmlToText()', () => {
     test('handles invalid args', () => {
+        // @ts-expect-error invalid input type
         checkHtmlToText(null, '');
         checkHtmlToText('', '');
-        // @ts-expect-error
+        // @ts-expect-error invalid input type
         checkHtmlToText(0, '');
+        // @ts-expect-error invalid input type
         checkHtmlToText(undefined, '');
     });
 
@@ -52,7 +55,10 @@ describe('htmlToText()', () => {
         checkHtmlToText('<h1>Header 1</h1> <br> <h2>Header 2</h2><br><br><br>', 'Header 1\n\nHeader 2');
         checkHtmlToText('<h1>Header 1</h1>  \n <br>\n<h2>Header 2</h2><br><br><br>', 'Header 1\n\nHeader 2');
         checkHtmlToText('<h1>Header 1</h1>  \n <br>\n<br><h2>Header 2</h2><br><br><br>', 'Header 1\n\n\nHeader 2');
-        checkHtmlToText('<h1>Header 1</h1>  \n <br>\n<br><br><h2>Header 2</h2><br><br><br>', 'Header 1\n\n\n\nHeader 2');
+        checkHtmlToText(
+            '<h1>Header 1</h1>  \n <br>\n<br><br><h2>Header 2</h2><br><br><br>',
+            'Header 1\n\n\n\nHeader 2',
+        );
 
         checkHtmlToText('<div><div>Div</div><p>Paragraph</p></div>', 'Div\nParagraph');
         checkHtmlToText('<div>Div1</div><!-- Some comments --><div>Div2</div>', 'Div1\nDiv2');

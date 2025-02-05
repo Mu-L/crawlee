@@ -1,14 +1,19 @@
-import type { Log } from '@apify/log';
 import { EventEmitter } from 'node:events';
+
+import type { Log } from '@apify/log';
 import type { Dictionary } from '@crawlee/types';
+import { AsyncQueue } from '@sapphire/async-queue';
 import ow from 'ow';
-import { Configuration } from '../configuration';
-import { log as defaultLog } from '../log';
-import { KeyValueStore } from '../storages/key_value_store';
+
+import { BLOCKED_STATUS_CODES, MAX_POOL_SIZE, PERSIST_STATE_KEY } from './consts';
 import type { SessionOptions } from './session';
 import { Session } from './session';
+import { Configuration } from '../configuration';
+import type { PersistenceOptions } from '../crawlers/statistics';
 import type { EventManager } from '../events/event_manager';
 import { EventType } from '../events/event_manager';
+import { log as defaultLog } from '../log';
+import { KeyValueStore } from '../storages/key_value_store';
 
 /**
  * Factory user-function which creates customized {@apilink Session} instances.
@@ -56,6 +61,11 @@ export interface SessionPoolOptions {
 
     /** @internal */
     log?: Log;
+
+    /**
+     * Control how and when to persist the state of the session pool.
+     */
+    persistenceOptions?: PersistenceOptions;
 }
 
 /**
@@ -136,37 +146,52 @@ export class SessionPool extends EventEmitter {
     protected _listener!: () => Promise<void>;
     protected events: EventManager;
     protected readonly blockedStatusCodes: number[];
+    protected persistenceOptions: PersistenceOptions;
+    protected isInitialized = false;
+
+    private queue = new AsyncQueue();
 
     /**
      * @internal
      */
-    constructor(options: SessionPoolOptions = {}, readonly config = Configuration.getGlobalConfig()) {
+    constructor(
+        options: SessionPoolOptions = {},
+        readonly config = Configuration.getGlobalConfig(),
+    ) {
         super();
 
-        ow(options, ow.object.exactShape({
-            maxPoolSize: ow.optional.number,
-            persistStateKeyValueStoreId: ow.optional.string,
-            persistStateKey: ow.optional.string,
-            createSessionFunction: ow.optional.function,
-            sessionOptions: ow.optional.object,
-            blockedStatusCodes: ow.optional.array.ofType(ow.number),
-            log: ow.optional.object,
-        }));
+        ow(
+            options,
+            ow.object.exactShape({
+                maxPoolSize: ow.optional.number,
+                persistStateKeyValueStoreId: ow.optional.string,
+                persistStateKey: ow.optional.string,
+                createSessionFunction: ow.optional.function,
+                sessionOptions: ow.optional.object,
+                blockedStatusCodes: ow.optional.array.ofType(ow.number),
+                log: ow.optional.object,
+                persistenceOptions: ow.optional.object,
+            }),
+        );
 
         const {
-            maxPoolSize = 1000,
+            maxPoolSize = MAX_POOL_SIZE,
             persistStateKeyValueStoreId,
-            persistStateKey = 'SDK_SESSION_POOL_STATE',
+            persistStateKey = PERSIST_STATE_KEY,
             createSessionFunction,
             sessionOptions = {},
-            blockedStatusCodes = [401, 403, 429],
+            blockedStatusCodes = BLOCKED_STATUS_CODES,
             log = defaultLog,
+            persistenceOptions = {
+                enable: true,
+            },
         } = options;
 
         this.config = config;
         this.blockedStatusCodes = blockedStatusCodes;
         this.events = config.getEventManager();
         this.log = log.child({ prefix: 'SessionPool' });
+        this.persistenceOptions = persistenceOptions;
 
         // Pool Configuration
         this.maxPoolSize = maxPoolSize;
@@ -204,11 +229,20 @@ export class SessionPool extends EventEmitter {
      * It is called automatically by the {@apilink SessionPool.open} function.
      */
     async initialize(): Promise<void> {
+        if (this.isInitialized) {
+            return;
+        }
+
         this.keyValueStore = await KeyValueStore.open(this.persistStateKeyValueStoreId, { config: this.config });
+        if (!this.persistenceOptions.enable) {
+            this.isInitialized = true;
+            return;
+        }
 
         if (!this.persistStateKeyValueStoreId) {
-            // eslint-disable-next-line max-len
-            this.log.debug(`No 'persistStateKeyValueStoreId' options specified, this session pool's data has been saved in the KeyValueStore with the id: ${this.keyValueStore.id}`);
+            this.log.debug(
+                `No 'persistStateKeyValueStoreId' options specified, this session pool's data has been saved in the KeyValueStore with the id: ${this.keyValueStore.id}`,
+            );
         }
 
         // in case of migration happened and SessionPool state should be restored from the keyValueStore.
@@ -217,6 +251,7 @@ export class SessionPool extends EventEmitter {
         this._listener = this.persistState.bind(this);
 
         this.events.on(EventType.PERSIST_STATE, this._listener);
+        this.isInitialized = true;
     }
 
     /**
@@ -239,9 +274,8 @@ export class SessionPool extends EventEmitter {
             this._removeRetiredSessions();
         }
 
-        const newSession = options instanceof Session
-            ? options
-            : await this.createSessionFunction(this, { sessionOptions: options });
+        const newSession =
+            options instanceof Session ? options : await this.createSessionFunction(this, { sessionOptions: options });
         this.log.debug(`Adding new Session - ${newSession.id}`);
 
         this._addSession(newSession);
@@ -268,24 +302,42 @@ export class SessionPool extends EventEmitter {
      * @param [sessionId] If provided, it returns the usable session with this id, `undefined` otherwise.
      */
     async getSession(sessionId?: string): Promise<Session | undefined> {
-        this._throwIfNotInitialized();
-        if (sessionId) {
-            const session = this.sessionMap.get(sessionId);
-            if (session && session.isUsable()) return session;
-            return undefined;
+        await this.queue.wait();
+
+        try {
+            this._throwIfNotInitialized();
+
+            if (sessionId) {
+                const session = this.sessionMap.get(sessionId);
+                if (session && session.isUsable()) return session;
+                return undefined;
+            }
+
+            if (this._hasSpaceForSession()) {
+                return await this._createSession();
+            }
+
+            const pickedSession = this._pickSession();
+            if (pickedSession.isUsable()) {
+                return pickedSession;
+            }
+
+            this._removeRetiredSessions();
+            return await this._createSession();
+        } finally {
+            this.queue.shift();
+        }
+    }
+
+    /**
+     * @param options - Override the persistence options provided in the constructor
+     */
+    async resetStore(options?: PersistenceOptions) {
+        if (!this.persistenceOptions.enable && !options?.enable) {
+            return;
         }
 
-        if (this._hasSpaceForSession()) {
-            return this._createSession();
-        }
-
-        const pickedSession = this._pickSession();
-        if (pickedSession.isUsable()) {
-            return pickedSession;
-        }
-
-        this._removeRetiredSessions();
-        return this._createSession();
+        await this.keyValueStore?.setValue(this.persistStateKey, null);
     }
 
     /**
@@ -303,8 +355,13 @@ export class SessionPool extends EventEmitter {
     /**
      * Persists the current state of the `SessionPool` into the default {@apilink KeyValueStore}.
      * The state is persisted automatically in regular intervals.
+     * @param options - Override the persistence options provided in the constructor
      */
-    async persistState(): Promise<void> {
+    async persistState(options?: PersistenceOptions): Promise<void> {
+        if (!this.persistenceOptions.enable && !options?.enable) {
+            return;
+        }
+
         this.log.debug('Persisting state', {
             persistStateKeyValueStoreId: this.persistStateKeyValueStoreId,
             persistStateKey: this.persistStateKey,
@@ -325,7 +382,7 @@ export class SessionPool extends EventEmitter {
      * SessionPool should not work before initialization.
      */
     protected _throwIfNotInitialized() {
-        if (!this._listener) throw new Error('SessionPool is not initialized.');
+        if (!this.isInitialized) throw new Error('SessionPool is not initialized.');
     }
 
     /**
@@ -365,7 +422,10 @@ export class SessionPool extends EventEmitter {
      * @param [options.sessionOptions] The configuration options for the session being created.
      * @returns New session.
      */
-    protected _defaultCreateSessionFunction(sessionPool: SessionPool, options: { sessionOptions?: SessionOptions } = {}): Session {
+    protected _defaultCreateSessionFunction(
+        sessionPool: SessionPool,
+        options: { sessionOptions?: SessionOptions } = {},
+    ): Session {
         ow(options, ow.object.exactShape({ sessionOptions: ow.optional.object }));
         const { sessionOptions = {} } = options;
         return new Session({
@@ -421,7 +481,7 @@ export class SessionPool extends EventEmitter {
             sessionObject.sessionPool = this;
             sessionObject.createdAt = new Date(sessionObject.createdAt as string);
             sessionObject.expiresAt = new Date(sessionObject.expiresAt as string);
-            const recreatedSession = new Session(sessionObject);
+            const recreatedSession = await this.createSessionFunction(this, { sessionOptions: sessionObject });
 
             if (recreatedSession.isUsable()) {
                 this._addSession(recreatedSession);
@@ -437,8 +497,8 @@ export class SessionPool extends EventEmitter {
      *
      * For more details and code examples, see the {@apilink SessionPool} class.
      */
-    static async open(options?: SessionPoolOptions): Promise<SessionPool> {
-        const sessionPool = new SessionPool(options);
+    static async open(options?: SessionPoolOptions, config?: Configuration): Promise<SessionPool> {
+        const sessionPool = new SessionPool(options, config);
         await sessionPool.initialize();
         return sessionPool;
     }

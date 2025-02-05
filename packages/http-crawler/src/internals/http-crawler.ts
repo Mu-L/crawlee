@@ -1,13 +1,21 @@
+import type { IncomingHttpHeaders, IncomingMessage } from 'node:http';
+import { extname } from 'node:path';
+import util from 'node:util';
+import type { Readable } from 'stream';
+
 import { addTimeoutToPromise, tryCancel } from '@apify/timeout';
 import { concatStreamToBuffer, readStreamToString } from '@apify/utilities';
 import type {
     AutoscaledPoolOptions,
     BasicCrawlerOptions,
-    ErrorHandler,
-    RequestHandler,
     CrawlingContext,
+    ErrorHandler,
+    GetUserDataFromRequest,
+    LoadedContext,
     ProxyConfiguration,
     Request,
+    RequestHandler,
+    RouterRoutes,
     Session,
 } from '@crawlee/basic';
 import {
@@ -19,19 +27,36 @@ import {
     validators,
     Configuration,
     RequestState,
+    SessionError,
+    processHttpRequestOptions,
 } from '@crawlee/basic';
+import type { HttpResponse, StreamingHttpResponse } from '@crawlee/core';
 import type { Awaitable, Dictionary } from '@crawlee/types';
+import { RETRY_CSS_SELECTORS, type CheerioRoot } from '@crawlee/utils';
+import * as cheerio from 'cheerio';
 import type { RequestLike, ResponseLike } from 'content-type';
 import contentTypeParser from 'content-type';
-import mime from 'mime-types';
-import type { OptionsInit, Method, Request as GotRequest, Options } from 'got-scraping';
-import { gotScraping, TimeoutError } from 'got-scraping';
-import type { JsonValue } from 'type-fest';
-import { extname } from 'node:path';
-import type { IncomingHttpHeaders, IncomingMessage } from 'node:http';
+import type {
+    OptionsInit,
+    Method,
+    TimeoutError as TimeoutErrorClass,
+    // @ts-expect-error This throws a compilation error due to got-scraping being ESM only but we only import types, so its alllll gooooood
+} from 'got-scraping';
 import iconv from 'iconv-lite';
-import ow from 'ow';
-import util from 'node:util';
+import mime from 'mime-types';
+import ow, { ObjectPredicate } from 'ow';
+import type { JsonValue } from 'type-fest';
+
+let TimeoutError: typeof TimeoutErrorClass;
+
+/**
+ * TODO exists for BC within HttpCrawler - replace completely with StreamingHttpResponse in 4.0
+ * @internal
+ */
+export type PlainResponse = Omit<HttpResponse, 'body'> &
+    IncomingMessage & {
+        body?: unknown;
+    };
 
 /**
  * Default mime types, which HttpScraper supports.
@@ -52,9 +77,10 @@ const HTTP_OPTIMIZED_AUTOSCALED_POOL_OPTIONS: AutoscaledPoolOptions = {
 export type HttpErrorHandler<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     JSONData extends JsonValue = any, // with default to Dictionary we cant use a typed router in untyped crawler
-    > = ErrorHandler<HttpCrawlingContext<UserData, JSONData>>;
+> = ErrorHandler<HttpCrawlingContext<UserData, JSONData>>;
 
-export interface HttpCrawlerOptions<Context extends InternalHttpCrawlingContext = InternalHttpCrawlingContext> extends BasicCrawlerOptions<Context> {
+export interface HttpCrawlerOptions<Context extends InternalHttpCrawlingContext = InternalHttpCrawlingContext>
+    extends BasicCrawlerOptions<Context> {
     /**
      * An alias for {@apilink HttpCrawlerOptions.requestHandler}
      * Soon to be removed, use `requestHandler` instead.
@@ -148,15 +174,24 @@ export interface HttpCrawlerOptions<Context extends InternalHttpCrawlingContext 
      * It passes the "Cookie" header to the request with the session cookies.
      */
     persistCookiesPerSession?: boolean;
+
+    /**
+     * An array of HTTP response [Status Codes](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status) to be excluded from error consideration.
+     * By default, status codes >= 500 trigger errors.
+     */
+    ignoreHttpErrorStatusCodes?: number[];
+
+    /**
+     * An array of additional HTTP response [Status Codes](https://developer.mozilla.org/en-US/docs/Web/HTTP/Status) to be treated as errors.
+     * By default, status codes >= 500 trigger errors.
+     */
+    additionalHttpErrorStatusCodes?: number[];
 }
 
 /**
  * @internal
  */
-export type InternalHttpHook<Context> = (
-    crawlingContext: Context,
-    gotOptions: OptionsInit,
-) => Awaitable<void>;
+export type InternalHttpHook<Context> = (crawlingContext: Context, gotOptions: OptionsInit) => Awaitable<void>;
 
 export type HttpHook<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
@@ -169,15 +204,15 @@ export type HttpHook<
 export interface InternalHttpCrawlingContext<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     JSONData extends JsonValue = any, // with default to Dictionary we cant use a typed router in untyped crawler
-    Crawler = HttpCrawler<any>
-    > extends CrawlingContext<Crawler, UserData> {
+    Crawler = HttpCrawler<any>,
+> extends CrawlingContext<Crawler, UserData> {
     /**
      * The request body of the web page.
      * The type depends on the `Content-Type` header of the web page:
      * - String for `text/html`, `application/xhtml+xml`, `application/xml` MIME content types
      * - Buffer for others MIME content types
      */
-    body: (string | Buffer);
+    body: string | Buffer;
 
     /**
      * The parsed object from JSON string if the response contains the content type application/json.
@@ -188,7 +223,35 @@ export interface InternalHttpCrawlingContext<
      * Parsed `Content-Type header: { type, encoding }`.
      */
     contentType: { type: string; encoding: BufferEncoding };
-    response: IncomingMessage;
+    response: PlainResponse;
+
+    /**
+     * Wait for an element matching the selector to appear. Timeout is ignored.
+     *
+     * **Example usage:**
+     * ```ts
+     * async requestHandler({ waitForSelector, parseWithCheerio }) {
+     *     await waitForSelector('article h1');
+     *     const $ = await parseWithCheerio();
+     *     const title = $('title').text();
+     * });
+     * ```
+     */
+    waitForSelector(selector: string, timeoutMs?: number): Promise<void>;
+
+    /**
+     * Returns Cheerio handle for `page.content()`, allowing to work with the data same way as with {@apilink CheerioCrawler}.
+     * When provided with the `selector` argument, it will throw if it's not available.
+     *
+     * **Example usage:**
+     * ```ts
+     * async requestHandler({ parseWithCheerio }) {
+     *     const $ = await parseWithCheerio();
+     *     const title = $('title').text();
+     * });
+     * ```
+     */
+    parseWithCheerio(selector?: string, timeoutMs?: number): Promise<CheerioRoot>;
 }
 
 export interface HttpCrawlingContext<UserData extends Dictionary = any, JSONData extends JsonValue = any>
@@ -197,7 +260,7 @@ export interface HttpCrawlingContext<UserData extends Dictionary = any, JSONData
 export type HttpRequestHandler<
     UserData extends Dictionary = any, // with default to Dictionary we cant use a typed router in untyped crawler
     JSONData extends JsonValue = any, // with default to Dictionary we cant use a typed router in untyped crawler
-    > = RequestHandler<HttpCrawlingContext<UserData, JSONData>>;
+> = RequestHandler<HttpCrawlingContext<UserData, JSONData>>;
 
 /**
  * Provides a framework for the parallel crawling of web pages using plain HTTP requests.
@@ -266,7 +329,9 @@ export type HttpRequestHandler<
  * ```
  * @category Crawlers
  */
-export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, HttpCrawler<Context>>> extends BasicCrawler<Context> {
+export class HttpCrawler<
+    Context extends InternalHttpCrawlingContext<any, any, HttpCrawler<Context>>,
+> extends BasicCrawler<Context> {
     /**
      * A reference to the underlying {@apilink ProxyConfiguration} class that manages the crawler's proxies.
      * Only available if used by the crawler.
@@ -281,6 +346,8 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
     protected ignoreSslErrors: boolean;
     protected suggestResponseEncoding?: string;
     protected forceResponseEncoding?: string;
+    protected additionalHttpErrorStatusCodes: Set<number>;
+    protected ignoreHttpErrorStatusCodes: Set<number>;
     protected readonly supportedMimeTypes: Set<string>;
 
     protected static override optionsShape = {
@@ -295,6 +362,9 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
         proxyConfiguration: ow.optional.object.validate(validators.proxyConfiguration),
         persistCookiesPerSession: ow.optional.boolean,
 
+        additionalHttpErrorStatusCodes: ow.optional.array.ofType(ow.number),
+        ignoreHttpErrorStatusCodes: ow.optional.array.ofType(ow.number),
+
         preNavigationHooks: ow.optional.array,
         postNavigationHooks: ow.optional.array,
     };
@@ -302,7 +372,10 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
     /**
      * All `HttpCrawlerOptions` parameters are passed via an options object.
      */
-    constructor(options: HttpCrawlerOptions<Context> = {}, override readonly config = Configuration.getGlobalConfig()) {
+    constructor(
+        options: HttpCrawlerOptions<Context> = {},
+        override readonly config = Configuration.getGlobalConfig(),
+    ) {
         ow(options, 'HttpCrawlerOptions', ow.object.exactShape(HttpCrawler.optionsShape));
 
         const {
@@ -319,6 +392,8 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
             persistCookiesPerSession,
             preNavigationHooks = [],
             postNavigationHooks = [],
+            additionalHttpErrorStatusCodes = [],
+            ignoreHttpErrorStatusCodes = [],
 
             // Ignored
             handleRequestFunction,
@@ -328,14 +403,18 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
             ...basicCrawlerOptions
         } = options;
 
-        super({
-            ...basicCrawlerOptions,
-            requestHandler,
-            autoscaledPoolOptions,
-            // We need to add some time for internal functions to finish,
-            // but not too much so that we would stall the crawler.
-            requestHandlerTimeoutSecs: navigationTimeoutSecs + requestHandlerTimeoutSecs + BASIC_CRAWLER_TIMEOUT_BUFFER_SECS,
-        }, config);
+        super(
+            {
+                ...basicCrawlerOptions,
+                requestHandler,
+                autoscaledPoolOptions,
+                // We need to add some time for internal functions to finish,
+                // but not too much so that we would stall the crawler.
+                requestHandlerTimeoutSecs:
+                    navigationTimeoutSecs + requestHandlerTimeoutSecs + BASIC_CRAWLER_TIMEOUT_BUFFER_SECS,
+            },
+            config,
+        );
 
         this._handlePropertyNameChange({
             newName: 'requestHandler',
@@ -359,7 +438,9 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
         if (additionalMimeTypes.length) this._extendSupportedMimeTypes(additionalMimeTypes);
 
         if (suggestResponseEncoding && forceResponseEncoding) {
-            this.log.warning('Both forceResponseEncoding and suggestResponseEncoding options are set. Using forceResponseEncoding.');
+            this.log.warning(
+                'Both forceResponseEncoding and suggestResponseEncoding options are set. Using forceResponseEncoding.',
+            );
         }
 
         this.userRequestHandlerTimeoutMillis = requestHandlerTimeoutSecs * 1000;
@@ -367,6 +448,8 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
         this.ignoreSslErrors = ignoreSslErrors;
         this.suggestResponseEncoding = suggestResponseEncoding;
         this.forceResponseEncoding = forceResponseEncoding;
+        this.additionalHttpErrorStatusCodes = new Set([...additionalHttpErrorStatusCodes]);
+        this.ignoreHttpErrorStatusCodes = new Set([...ignoreHttpErrorStatusCodes]);
         this.proxyConfiguration = proxyConfiguration;
         this.preNavigationHooks = preNavigationHooks;
         this.postNavigationHooks = [
@@ -400,11 +483,15 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
             const isSameType = originalType === extensionType || value == null; // fast track for deleting keys
             const exists = this[key as keyof this] != null;
 
-            if (!isConfigurable) { // Test if the property can be configured on the crawler
-                throw new Error(`${extension.name} tries to set property "${key}" that is not configurable on ${className} instance.`);
+            if (!isConfigurable) {
+                // Test if the property can be configured on the crawler
+                throw new Error(
+                    `${extension.name} tries to set property "${key}" that is not configurable on ${className} instance.`,
+                );
             }
 
-            if (!isSameType && exists) { // Assuming that extensions will only add up configuration
+            if (!isSameType && exists) {
+                // Assuming that extensions will only add up configuration
                 throw new Error(
                     `${extension.name} tries to set property of different type "${extensionType}". "${className}.${key}: ${originalType}".`,
                 );
@@ -424,8 +511,9 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
 
         if (this.proxyConfiguration) {
             const sessionId = session ? session.id : undefined;
-            crawlingContext.proxyInfo = await this.proxyConfiguration.newProxyInfo(sessionId);
+            crawlingContext.proxyInfo = await this.proxyConfiguration.newProxyInfo(sessionId, { request });
         }
+
         if (!request.skipNavigation) {
             await this._handleNavigation(crawlingContext);
             tryCancel();
@@ -435,15 +523,45 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
             const contentType = parsed.contentType!;
             tryCancel();
 
+            // `??=` because descendant classes may already set optimized version
+            crawlingContext.waitForSelector ??= async (selector?: string, _timeoutMs?: number) => {
+                const $ = cheerio.load(parsed.body!.toString());
+
+                if ($(selector).get().length === 0) {
+                    throw new Error(`Selector '${selector}' not found.`);
+                }
+            };
+            crawlingContext.parseWithCheerio ??= async (selector?: string, timeoutMs?: number) => {
+                const $ = cheerio.load(parsed.body!.toString());
+
+                if (selector) {
+                    await crawlingContext.waitForSelector(selector, timeoutMs);
+                }
+
+                return $;
+            };
+
             if (this.useSessionPool) {
-                this._throwOnBlockedRequest(session!, response.statusCode!);
+                this._throwOnBlockedRequest(crawlingContext.session!, response.statusCode!);
             }
 
             if (this.persistCookiesPerSession) {
-                session!.setCookiesFromResponse(response);
+                crawlingContext.session!.setCookiesFromResponse(response);
             }
 
             request.loadedUrl = response.url;
+
+            if (!this.requestMatchesEnqueueStrategy(request)) {
+                this.log.debug(
+                    // eslint-disable-next-line dot-notation
+                    `Skipping request ${request.id} (starting url: ${request.url} -> loaded url: ${request.loadedUrl}) because it does not match the enqueue strategy (${request['enqueueStrategy']}).`,
+                );
+
+                request.noRetry = true;
+                request.state = RequestState.SKIPPED;
+
+                return;
+            }
 
             Object.assign(crawlingContext, parsed);
 
@@ -456,10 +574,15 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
             });
         }
 
+        if (this.retryOnBlocked) {
+            const error = await this.isRequestBlocked(crawlingContext);
+            if (error) throw new SessionError(error);
+        }
+
         request.state = RequestState.REQUEST_HANDLER;
         try {
             await addTimeoutToPromise(
-                () => Promise.resolve(this.requestHandler(crawlingContext)),
+                async () => Promise.resolve(this.requestHandler(crawlingContext as LoadedContext<Context>)),
                 this.userRequestHandlerTimeoutMillis,
                 `requestHandler timed out after ${this.userRequestHandlerTimeoutMillis / 1000} seconds.`,
             );
@@ -468,6 +591,19 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
             request.state = RequestState.ERROR;
             throw e;
         }
+    }
+
+    protected override async isRequestBlocked(crawlingContext: Context): Promise<string | false> {
+        if (HTML_AND_XML_MIME_TYPES.includes(crawlingContext.contentType.type)) {
+            const $ = await crawlingContext.parseWithCheerio();
+
+            const foundSelectors = RETRY_CSS_SELECTORS.filter((selector) => $(selector).length > 0);
+
+            if (foundSelectors.length > 0) {
+                return `Found selectors: ${foundSelectors.join(', ')}`;
+            }
+        }
+        return false;
     }
 
     protected async _handleNavigation(crawlingContext: Context) {
@@ -488,7 +624,7 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
         const proxyUrl = crawlingContext.proxyInfo?.url;
 
         crawlingContext.response = await addTimeoutToPromise(
-            () => this._requestFunction({ request, session, proxyUrl, gotOptions }),
+            async () => this._requestFunction({ request, session, proxyUrl, gotOptions }),
             this.navigationTimeoutMillis,
             `request timed out after ${this.navigationTimeoutMillis / 1000} seconds.`,
         );
@@ -502,18 +638,21 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
     /**
      * Sets the cookie header to `gotOptions` based on the provided request and session headers, as well as any changes that occurred due to hooks.
      */
-    private _applyCookies({ session, request }: CrawlingContext, gotOptions: OptionsInit, preHookCookies: string, postHookCookies: string) {
+    protected _applyCookies(
+        { session, request }: CrawlingContext,
+        gotOptions: OptionsInit,
+        preHookCookies: string,
+        postHookCookies: string,
+    ) {
         const sessionCookie = session?.getCookieString(request.url) ?? '';
-        let alteredGotOptionsCookies = (gotOptions.headers?.Cookie || gotOptions.headers?.cookie || '');
+        let alteredGotOptionsCookies = gotOptions.headers?.Cookie || gotOptions.headers?.cookie || '';
 
         if (gotOptions.headers?.Cookie && gotOptions.headers?.cookie) {
-            const {
-                Cookie: upperCaseHeader,
-                cookie: lowerCaseHeader,
-            } = gotOptions.headers;
+            const { Cookie: upperCaseHeader, cookie: lowerCaseHeader } = gotOptions.headers;
 
-            // eslint-disable-next-line max-len
-            this.log.warning(`Encountered mixed casing for the cookie headers in the got options for request ${request.url} (${request.id}). Their values will be merged`);
+            this.log.warning(
+                `Encountered mixed casing for the cookie headers in the got options for request ${request.url} (${request.id}). Their values will be merged`,
+            );
 
             const sourceCookies = [];
 
@@ -532,10 +671,7 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
             alteredGotOptionsCookies = mergeCookies(request.url, sourceCookies);
         }
 
-        const sourceCookies = [
-            sessionCookie,
-            preHookCookies,
-        ];
+        const sourceCookies = [sessionCookie, preHookCookies];
 
         if (Array.isArray(alteredGotOptionsCookies)) {
             sourceCookies.push(...alteredGotOptionsCookies);
@@ -561,7 +697,17 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
      * on the request such as only downloading the request body if the
      * received content type matches text/html, application/xml, application/xhtml+xml.
      */
-    protected async _requestFunction({ request, session, proxyUrl, gotOptions }: RequestFunctionOptions): Promise<IncomingMessage> {
+    protected async _requestFunction({
+        request,
+        session,
+        proxyUrl,
+        gotOptions,
+    }: RequestFunctionOptions): Promise<PlainResponse> {
+        if (!TimeoutError) {
+            // @ts-ignore
+            ({ TimeoutError } = await import('got-scraping'));
+        }
+
         const opts = this._getRequestOptions(request, session, proxyUrl, gotOptions);
 
         try {
@@ -569,10 +715,14 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
         } catch (e) {
             if (e instanceof TimeoutError) {
                 this._handleRequestTimeout(session);
-                return undefined as unknown as IncomingMessage;
+                return undefined as unknown as PlainResponse;
             }
 
-            throw e;
+            if (this.isProxyError(e as Error)) {
+                throw new SessionError(this._getMessageFromError(e as Error) as string);
+            } else {
+                throw e;
+            }
         }
     }
 
@@ -589,7 +739,10 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
             this.stats.registerStatusCode(statusCode!);
         }
 
-        if (statusCode! >= 500) {
+        const excludeError = this.ignoreHttpErrorStatusCodes.has(statusCode!);
+        const includeError = this.additionalHttpErrorStatusCodes.has(statusCode!);
+
+        if ((statusCode! >= 500 && !excludeError) || includeError) {
             const body = await readStreamToString(response, encoding);
 
             // Errors are often sent as JSON, so attempt to parse them,
@@ -601,6 +754,10 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
                 throw new Error(`${statusCode} - ${message}`);
             }
 
+            if (includeError) {
+                throw new Error(`${statusCode} - Error status code was set by user.`);
+            }
+
             // It's not a JSON, so it's probably some text. Get the first 100 chars of it.
             throw new Error(`${statusCode} - Internal Server Error: ${body.slice(0, 100)}`);
         } else if (HTML_AND_XML_MIME_TYPES.includes(type)) {
@@ -609,11 +766,20 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
             return { ...parsed, isXml, response, contentType };
         } else {
             const body = await concatStreamToBuffer(response);
-            return { body, response, contentType };
+            return {
+                body,
+                response,
+                contentType,
+                enqueueLinks: async () => Promise.resolve({ processedRequests: [], unprocessedRequests: [] }),
+            };
         }
     }
 
-    protected async _parseHTML(response: IncomingMessage, _isXml: boolean, _crawlingContext: Context): Promise<Partial<Context>> {
+    protected async _parseHTML(
+        response: IncomingMessage,
+        _isXml: boolean,
+        _crawlingContext: Context,
+    ): Promise<Partial<Context>> {
         return {
             body: await concatStreamToBuffer(response),
         } as Partial<Context>;
@@ -623,7 +789,7 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
      * Combines the provided `requestOptions` with mandatory (non-overridable) values.
      */
     protected _getRequestOptions(request: Request, session?: Session, proxyUrl?: string, gotOptions?: OptionsInit) {
-        const requestOptions: OptionsInit & { isStream: true } = {
+        const requestOptions: OptionsInit & Required<Pick<OptionsInit, 'url'>> & { isStream: true } = {
             url: request.url,
             method: request.method as Method,
             proxyUrl,
@@ -657,7 +823,11 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
         return requestOptions;
     }
 
-    protected _encodeResponse(request: Request, response: IncomingMessage, encoding: BufferEncoding): {
+    protected _encodeResponse(
+        request: Request,
+        response: IncomingMessage,
+        encoding: BufferEncoding,
+    ): {
         encoding: BufferEncoding;
         response: IncomingMessage;
     } {
@@ -730,39 +900,51 @@ export class HttpCrawler<Context extends InternalHttpCrawlingContext<any, any, H
 
         if (statusCode === 406) {
             request.noRetry = true;
-            throw new Error(`Resource ${request.url} is not available in the format requested by the Accept header. Skipping resource.`);
+            throw new Error(
+                `Resource ${request.url} is not available in the format requested by the Accept header. Skipping resource.`,
+            );
         }
 
-        if (!this.supportedMimeTypes.has(type) && !this.supportedMimeTypes.has('*/*') && statusCode! < 500) {
+        // eslint-disable-next-line dot-notation -- accessing private property
+        const blockedStatusCodes = this.sessionPool ? this.sessionPool['blockedStatusCodes'] : [];
+        // if we retry the request, can the Content-Type change?
+        const isTransientContentType = statusCode! >= 500 || blockedStatusCodes.includes(statusCode!);
+
+        if (!this.supportedMimeTypes.has(type) && !this.supportedMimeTypes.has('*/*') && !isTransientContentType) {
             request.noRetry = true;
-            throw new Error(`Resource ${request.url} served Content-Type ${type}, `
-                + `but only ${Array.from(this.supportedMimeTypes).join(', ')} are allowed. Skipping resource.`);
+            throw new Error(
+                `Resource ${request.url} served Content-Type ${type}, ` +
+                    `but only ${Array.from(this.supportedMimeTypes).join(', ')} are allowed. Skipping resource.`,
+            );
         }
     }
 
     /**
      * @internal wraps public utility for mocking purposes
      */
-    private _requestAsBrowser = (options: OptionsInit & { isStream: true }, session?: Session) => {
-        return new Promise<IncomingMessage>((resolve, reject) => {
-            const stream = gotScraping(options);
-
-            stream.on('redirect', (updatedOptions: Options, redirectResponse: IncomingMessage) => {
+    private _requestAsBrowser = async (
+        options: OptionsInit & { url: string | URL; isStream: true },
+        session?: Session,
+    ) => {
+        const response = await this.httpClient.stream(
+            processHttpRequestOptions({
+                ...options,
+                cookieJar: options.cookieJar as any, // HACK - the type of ToughCookieJar in got is wrong
+                responseType: 'text',
+            }),
+            (redirectResponse, updatedRequest) => {
                 if (this.persistCookiesPerSession) {
                     session!.setCookiesFromResponse(redirectResponse);
 
-                    const cookieString = session!.getCookieString(updatedOptions.url!.toString());
+                    const cookieString = session!.getCookieString(updatedRequest.url!.toString());
                     if (cookieString !== '') {
-                        updatedOptions.headers.Cookie = cookieString;
+                        updatedRequest.headers.Cookie = cookieString;
                     }
                 }
-            });
+            },
+        );
 
-            stream.on('error', reject);
-            stream.on('response', () => {
-                resolve(addResponsePropertiesToStream(stream));
-            });
-        });
+        return addResponsePropertiesToStream(response.stream, response);
     };
 }
 
@@ -781,21 +963,26 @@ interface RequestFunctionOptions {
  * from the response stream to the got stream.
  * @internal
  */
-function addResponsePropertiesToStream(stream: GotRequest) {
-    const properties = [
-        'statusCode', 'statusMessage', 'headers',
-        'complete', 'httpVersion', 'rawHeaders',
-        'rawTrailers', 'trailers', 'url',
+function addResponsePropertiesToStream(stream: Readable, response: StreamingHttpResponse) {
+    const properties: (keyof PlainResponse)[] = [
+        'statusCode',
+        'statusMessage',
+        'headers',
+        'complete',
+        'httpVersion',
+        'rawHeaders',
+        'rawTrailers',
+        'trailers',
+        'url',
         'request',
     ];
 
-    const response = stream.response!;
+    stream.on('end', () => {
+        // @ts-expect-error
+        if (stream.rawTrailers) stream.rawTrailers = response.rawTrailers; // TODO BC with got - remove in 4.0
 
-    response.on('end', () => {
         // @ts-expect-error
-        Object.assign(stream.rawTrailers, response.rawTrailers);
-        // @ts-expect-error
-        Object.assign(stream.trailers, response.trailers);
+        if (stream.trailers) stream.trailers = response.trailers;
 
         // @ts-expect-error
         stream.complete = response.complete;
@@ -803,30 +990,32 @@ function addResponsePropertiesToStream(stream: GotRequest) {
 
     for (const prop of properties) {
         if (!(prop in stream)) {
-            // @ts-expect-error
-            stream[prop] = response[prop as keyof IncomingMessage];
+            (stream as any)[prop] = (response as any)[prop];
         }
     }
 
-    return stream as unknown as IncomingMessage;
+    return stream as unknown as PlainResponse;
 }
 
 /**
  * Gets parsed content type from response object
  * @param response HTTP response object
  */
-function parseContentTypeFromResponse(response: IncomingMessage): { type: string; charset: BufferEncoding } {
-    ow(response, ow.object.partialShape({
-        url: ow.string.url,
-        headers: ow.object,
-    }));
+function parseContentTypeFromResponse(response: unknown): { type: string; charset: BufferEncoding } {
+    ow(
+        response,
+        ow.object.partialShape({
+            url: ow.string.url,
+            headers: new ObjectPredicate<Record<string, unknown>>(),
+        }),
+    );
 
     const { url, headers } = response;
     let parsedContentType;
 
     if (headers['content-type']) {
         try {
-            parsedContentType = contentTypeParser.parse(headers['content-type']);
+            parsedContentType = contentTypeParser.parse(headers['content-type'] as string);
         } catch {
             // Can not parse content type from Content-Type header. Try to parse it from file extension.
         }
@@ -835,8 +1024,8 @@ function parseContentTypeFromResponse(response: IncomingMessage): { type: string
     // Parse content type from file extension as fallback
     if (!parsedContentType) {
         const parsedUrl = new URL(url);
-        const contentTypeFromExtname = mime.contentType(extname(parsedUrl.pathname))
-            || 'application/octet-stream; charset=utf-8'; // Fallback content type, specified in https://tools.ietf.org/html/rfc7231#section-3.1.1.5
+        const contentTypeFromExtname =
+            mime.contentType(extname(parsedUrl.pathname)) || 'application/octet-stream; charset=utf-8'; // Fallback content type, specified in https://tools.ietf.org/html/rfc7231#section-3.1.1.5
         parsedContentType = contentTypeParser.parse(contentTypeFromExtname);
     }
 
@@ -870,6 +1059,9 @@ function parseContentTypeFromResponse(response: IncomingMessage): { type: string
  * await crawler.run();
  * ```
  */
-export function createHttpRouter<Context extends HttpCrawlingContext = HttpCrawlingContext>() {
-    return Router.create<Context>();
+export function createHttpRouter<
+    Context extends HttpCrawlingContext = HttpCrawlingContext,
+    UserData extends Dictionary = GetUserDataFromRequest<Context['request']>,
+>(routes?: RouterRoutes<Context, UserData>) {
+    return Router.create<Context>(routes);
 }

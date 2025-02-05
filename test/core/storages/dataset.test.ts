@@ -17,7 +17,7 @@ describe('dataset', () => {
     const storageClient = Configuration.getStorageClient();
 
     beforeEach(async () => {
-        jest.clearAllMocks();
+        vitest.clearAllMocks();
     });
 
     describe('remote', () => {
@@ -29,34 +29,23 @@ describe('dataset', () => {
                 client: storageClient,
             });
 
-            const mockPushItems = jest
-                .spyOn(dataset.client, 'pushItems')
-                .mockResolvedValueOnce(null);
+            const pushItemSpy = vitest.spyOn(dataset.client, 'pushItems');
+
+            const mockPushItems = pushItemSpy.mockResolvedValueOnce(undefined);
 
             await dataset.pushData({ foo: 'bar' });
 
             expect(mockPushItems).toBeCalledTimes(1);
-            expect(mockPushItems).toBeCalledWith(
-                JSON.stringify({ foo: 'bar' }),
-            );
+            expect(mockPushItems).toBeCalledWith(JSON.stringify({ foo: 'bar' }));
 
-            const mockPushItems2 = jest
-                .spyOn(dataset.client, 'pushItems')
-                .mockResolvedValueOnce(null);
+            const mockPushItems2 = pushItemSpy.mockResolvedValueOnce(undefined);
 
-            await dataset.pushData([
-                { foo: 'hotel;' },
-                { foo: 'restaurant' },
-            ]);
+            await dataset.pushData([{ foo: 'hotel;' }, { foo: 'restaurant' }]);
 
             expect(mockPushItems2).toBeCalledTimes(2);
-            expect(mockPushItems2).toBeCalledWith(
-                JSON.stringify([{ foo: 'hotel;' }, { foo: 'restaurant' }]),
-            );
+            expect(mockPushItems2).toBeCalledWith(JSON.stringify([{ foo: 'hotel;' }, { foo: 'restaurant' }]));
 
-            const mockDelete = jest
-                .spyOn(dataset.client, 'delete')
-                .mockResolvedValueOnce(undefined);
+            const mockDelete = vitest.spyOn(dataset.client, 'delete').mockResolvedValueOnce(undefined);
 
             await dataset.drop();
 
@@ -72,14 +61,11 @@ describe('dataset', () => {
                 client: storageClient,
             });
 
-            const mockPushItems = jest.spyOn(dataset.client, 'pushItems');
-            mockPushItems.mockResolvedValueOnce(null);
-            mockPushItems.mockResolvedValueOnce(null);
+            const mockPushItems = vitest.spyOn(dataset.client, 'pushItems');
+            mockPushItems.mockResolvedValueOnce(undefined);
+            mockPushItems.mockResolvedValueOnce(undefined);
 
-            await dataset.pushData([
-                { foo: half },
-                { bar: half },
-            ]);
+            await dataset.pushData([{ foo: half }, { bar: half }]);
 
             expect(mockPushItems).toBeCalledTimes(2);
             expect(mockPushItems).toHaveBeenNthCalledWith(1, JSON.stringify([{ foo: half }]));
@@ -99,9 +85,9 @@ describe('dataset', () => {
                 client: storageClient,
             });
 
-            const mockPushItems = jest.spyOn(dataset.client, 'pushItems');
-            mockPushItems.mockResolvedValueOnce(null);
-            mockPushItems.mockResolvedValueOnce(null);
+            const mockPushItems = vitest.spyOn(dataset.client, 'pushItems');
+            mockPushItems.mockResolvedValueOnce(undefined);
+            mockPushItems.mockResolvedValueOnce(undefined);
 
             await dataset.pushData(data);
 
@@ -125,13 +111,7 @@ describe('dataset', () => {
             const full = mockData(MAX_PAYLOAD_SIZE_BYTES);
             const dataset = new Dataset({ id: 'some-id', client: storageClient });
             try {
-                await dataset.pushData([
-                    { foo: 0 },
-                    { foo: 1 },
-                    { foo: 2 },
-                    { foo: full },
-                    { foo: 4 },
-                ]);
+                await dataset.pushData([{ foo: 0 }, { foo: 1 }, { foo: 2 }, { foo: full }, { foo: 4 }]);
                 throw new Error('Should fail!');
             } catch (err) {
                 expect(err).toBeInstanceOf(Error);
@@ -146,10 +126,7 @@ describe('dataset', () => {
             });
 
             const expected = {
-                items: [
-                    { foo: 'bar' },
-                    { foo: 'hotel' },
-                ],
+                items: [{ foo: 'bar' }, { foo: 'hotel' }],
                 limit: 2,
                 total: 1000,
                 offset: 3,
@@ -157,7 +134,7 @@ describe('dataset', () => {
                 desc: false,
             };
 
-            const mockListItems = jest.spyOn(dataset.client, 'listItems');
+            const mockListItems = vitest.spyOn(dataset.client, 'listItems');
             mockListItems.mockResolvedValueOnce(expected);
 
             const result = await dataset.getData({ limit: 2, offset: 3 });
@@ -169,15 +146,17 @@ describe('dataset', () => {
 
             expect(result).toEqual(expected);
             let e;
-            const spy = jest.spyOn(dataset.client, 'listItems')
-                .mockImplementation(() => { throw new Error('Cannot create a string longer than 0x3fffffe7 characters'); });
+            const spy = vitest.spyOn(dataset.client, 'listItems').mockImplementation(() => {
+                throw new Error('Cannot create a string longer than 0x3fffffe7 characters');
+            });
             try {
                 await dataset.getData();
             } catch (err) {
                 e = err;
             }
-            expect((e as Error).message).toEqual('dataset.getData(): The response is too large for parsing. You can fix this by lowering the "limit" option.');
-            spy.mockRestore();
+            expect((e as Error).message).toEqual(
+                'dataset.getData(): The response is too large for parsing. You can fix this by lowering the "limit" option.',
+            );
         });
 
         test('getInfo() should work', async () => {
@@ -192,7 +171,7 @@ describe('dataset', () => {
                 itemCount: 14,
             };
 
-            const mockGetDataset = jest.spyOn(dataset.client, 'get');
+            const mockGetDataset = vitest.spyOn(dataset.client, 'get');
             mockGetDataset.mockResolvedValueOnce(expected);
 
             const result = await dataset.getInfo();
@@ -207,10 +186,7 @@ describe('dataset', () => {
             });
 
             const firstResolve = {
-                items: [
-                    { foo: 'a' },
-                    { foo: 'b' },
-                ],
+                items: [{ foo: 'a' }, { foo: 'b' }],
                 limit: 2,
                 total: 4,
                 offset: 0,
@@ -219,10 +195,7 @@ describe('dataset', () => {
             };
 
             const secondResolve = {
-                items: [
-                    { foo: 'c' },
-                    { foo: 'd' },
-                ],
+                items: [{ foo: 'c' }, { foo: 'd' }],
                 limit: 2,
                 total: 4,
                 offset: 2,
@@ -230,7 +203,7 @@ describe('dataset', () => {
                 desc: false,
             };
 
-            const mockListItems = jest.spyOn(dataset.client, 'listItems');
+            const mockListItems = vitest.spyOn(dataset.client, 'listItems');
             mockListItems.mockResolvedValueOnce(firstResolve);
             mockListItems.mockResolvedValueOnce(secondResolve);
 
@@ -254,19 +227,17 @@ describe('dataset', () => {
 
             const items: Dictionary[] = [];
             const indexes: number[] = [];
-            const result = await dataset.forEach((item, index) => {
-                items.push(item);
-                indexes.push(index);
-            }, {
-                limit: 2,
-            });
+            const result = await dataset.forEach(
+                (item, index) => {
+                    items.push(item);
+                    indexes.push(index);
+                },
+                {
+                    limit: 2,
+                },
+            );
             expect(result).toEqual(undefined);
-            expect(items).toEqual([
-                { foo: 'a' },
-                { foo: 'b' },
-                { foo: 'c' },
-                { foo: 'd' },
-            ]);
+            expect(items).toEqual([{ foo: 'a' }, { foo: 'b' }, { foo: 'c' }, { foo: 'd' }]);
             expect(indexes).toEqual([0, 1, 2, 3]);
 
             restoreAndVerify();
@@ -275,11 +246,14 @@ describe('dataset', () => {
         test('map() should work', async () => {
             const { dataset, restoreAndVerify } = getRemoteDataset();
 
-            const result = await dataset.map((item, index) => {
-                return { index, bar: 'xxx', ...item };
-            }, {
-                limit: 2,
-            });
+            const result = await dataset.map(
+                (item, index) => {
+                    return { index, bar: 'xxx', ...item };
+                },
+                {
+                    limit: 2,
+                },
+            );
 
             expect(result).toEqual([
                 { foo: 'a', index: 0, bar: 'xxx' },
@@ -294,12 +268,15 @@ describe('dataset', () => {
         test('map() should support promises', async () => {
             const { dataset, restoreAndVerify } = getRemoteDataset();
 
-            const result = await dataset.map((item, index) => {
-                const res = { index, bar: 'xxx', ...item };
-                return Promise.resolve(res);
-            }, {
-                limit: 2,
-            });
+            const result = await dataset.map(
+                async (item, index) => {
+                    const res = { index, bar: 'xxx', ...item };
+                    return Promise.resolve(res);
+                },
+                {
+                    limit: 2,
+                },
+            );
 
             expect(result).toEqual([
                 { foo: 'a', index: 0, bar: 'xxx' },
@@ -314,14 +291,18 @@ describe('dataset', () => {
         test('reduce() should work', async () => {
             const { dataset, restoreAndVerify } = getRemoteDataset();
 
-            const result = await dataset.reduce((memo, item, index) => {
-                item.index = index;
-                item.bar = 'xxx';
+            const result = await dataset.reduce(
+                (memo, item, index) => {
+                    item.index = index;
+                    item.bar = 'xxx';
 
-                return memo.concat(item);
-            }, [], {
-                limit: 2,
-            });
+                    return memo.concat(item);
+                },
+                [] as unknown[],
+                {
+                    limit: 2,
+                },
+            );
 
             expect(result).toEqual([
                 { foo: 'a', index: 0, bar: 'xxx' },
@@ -336,14 +317,18 @@ describe('dataset', () => {
         test('reduce() should support promises', async () => {
             const { dataset, restoreAndVerify } = getRemoteDataset();
 
-            const result = await dataset.reduce((memo, item, index) => {
-                item.index = index;
-                item.bar = 'xxx';
+            const result = await dataset.reduce(
+                async (memo, item, index) => {
+                    item.index = index;
+                    item.bar = 'xxx';
 
-                return Promise.resolve(memo.concat(item));
-            }, [], {
-                limit: 2,
-            });
+                    return Promise.resolve(memo.concat(item));
+                },
+                [] as unknown[],
+                {
+                    limit: 2,
+                },
+            );
 
             expect(result).toEqual([
                 { foo: 'a', index: 0, bar: 'xxx' },
@@ -361,12 +346,9 @@ describe('dataset', () => {
                 name: 'some-name',
                 client: storageClient,
             });
-            const mockListItems = jest.spyOn(dataset.client, 'listItems');
+            const mockListItems = vitest.spyOn(dataset.client, 'listItems');
             mockListItems.mockResolvedValueOnce({
-                items: [
-                    { foo: 4 },
-                    { foo: 5 },
-                ],
+                items: [{ foo: 4 }, { foo: 5 }],
                 limit: 2,
                 total: 4,
                 offset: 0,
@@ -374,10 +356,7 @@ describe('dataset', () => {
                 desc: false,
             });
             mockListItems.mockResolvedValueOnce({
-                items: [
-                    { foo: 4 },
-                    { foo: 1 },
-                ],
+                items: [{ foo: 4 }, { foo: 1 }],
                 limit: 2,
                 total: 4,
                 offset: 2,
@@ -387,12 +366,16 @@ describe('dataset', () => {
 
             const calledForIndexes: number[] = [];
 
-            const result = await dataset.reduce((memo, item, index) => {
-                calledForIndexes.push(index);
-                return Promise.resolve(memo.foo > item.foo ? memo : item);
-            }, undefined, {
-                limit: 2,
-            });
+            const result = await dataset.reduce(
+                async (memo, item, index) => {
+                    calledForIndexes.push(index);
+                    return Promise.resolve(memo.foo > item.foo ? memo : item);
+                },
+                undefined,
+                {
+                    limit: 2,
+                },
+            );
 
             expect(mockListItems).toBeCalledTimes(2);
             expect(mockListItems).toHaveBeenNthCalledWith(1, {
@@ -404,7 +387,7 @@ describe('dataset', () => {
                 offset: 2,
             });
 
-            expect(result.foo).toBe(5);
+            expect(result!.foo).toBe(5);
             expect(calledForIndexes).toEqual([1, 2, 3]);
         });
     });
@@ -416,16 +399,28 @@ describe('dataset', () => {
                 client: storageClient,
             });
             // @ts-expect-error JS-side validation
-            await expect(dataset.pushData()).rejects.toThrow('Expected `data` to be of type `object` but received type `undefined`');
+            await expect(dataset.pushData()).rejects.toThrow(
+                'Expected `data` to be of type `object` but received type `undefined`',
+            );
             // @ts-expect-error JS-side validation
-            await expect(dataset.pushData('')).rejects.toThrow('Expected `data` to be of type `object` but received type `string`');
+            await expect(dataset.pushData('')).rejects.toThrow(
+                'Expected `data` to be of type `object` but received type `string`',
+            );
             // @ts-expect-error JS-side validation
-            await expect(dataset.pushData(123)).rejects.toThrow('Expected `data` to be of type `object` but received type `number`');
+            await expect(dataset.pushData(123)).rejects.toThrow(
+                'Expected `data` to be of type `object` but received type `number`',
+            );
             // @ts-expect-error JS-side validation
-            await expect(dataset.pushData(true)).rejects.toThrow('Expected `data` to be of type `object` but received type `boolean`');
+            await expect(dataset.pushData(true)).rejects.toThrow(
+                'Expected `data` to be of type `object` but received type `boolean`',
+            );
             // @ts-expect-error JS-side validation
-            await expect(dataset.pushData(false)).rejects.toThrow('Expected `data` to be of type `object` but received type `boolean`');
-            await expect(dataset.pushData(() => {})).rejects.toThrow('Data item is not an object. You can push only objects into a dataset.');
+            await expect(dataset.pushData(false)).rejects.toThrow(
+                'Expected `data` to be of type `object` but received type `boolean`',
+            );
+            await expect(dataset.pushData(() => {})).rejects.toThrow(
+                'Data item is not an object. You can push only objects into a dataset.',
+            );
 
             const circularObj = {} as Dictionary;
             circularObj.xxx = circularObj;
@@ -480,17 +475,27 @@ describe('dataset', () => {
             expect(chunkBySize(triple, size + 1)).toEqual(triple);
             expect(chunkBySize(triple, size + 2)).toEqual([chunk, chunk, chunk]);
             // Chunks smaller items together
-            expect(chunkBySize(triple, (2 * size) + 3)).toEqual([`[${json},${json}]`, chunk]);
-            expect(chunkBySize([...triple, ...triple], (2 * size) + 3)).toEqual([`[${json},${json}]`, `[${json},${json}]`, `[${json},${json}]`]);
+            expect(chunkBySize(triple, 2 * size + 3)).toEqual([`[${json},${json}]`, chunk]);
+            expect(chunkBySize([...triple, ...triple], 2 * size + 3)).toEqual([
+                `[${json},${json}]`,
+                `[${json},${json}]`,
+                `[${json},${json}]`,
+            ]);
         });
 
         describe('exportToJSON', () => {
             const dataToPush = [
                 {
-                    hello: 'world',
+                    hello: 'world 1',
+                    foo: 'bar 1',
                 },
                 {
-                    foo: 'bar',
+                    foo: 'bar 2',
+                    hello: 'world 2',
+                },
+                {
+                    hello: 'world 3',
+                    foo: 'bar 3',
                 },
             ];
 
@@ -519,8 +524,12 @@ describe('dataset', () => {
                     foo: 'bar 1',
                 },
                 {
-                    hello: 'world 2',
                     foo: 'bar 2',
+                    hello: 'world 2',
+                },
+                {
+                    hello: 'world 3',
+                    foo: 'bar 3',
                 },
             ];
 
@@ -530,7 +539,7 @@ describe('dataset', () => {
                 await dataset.exportToCSV('HELLO-csv');
 
                 const kvData = await KeyValueStore.getValue('HELLO-csv');
-                expect(kvData).toEqual('hello,foo\nworld 1,bar 1\nworld 2,bar 2\n');
+                expect(kvData).toEqual('hello,foo\nworld 1,bar 1\nworld 2,bar 2\nworld 3,bar 3\n');
             });
 
             it('Should work as a static method for the default dataset', async () => {
@@ -538,7 +547,7 @@ describe('dataset', () => {
                 await Dataset.exportToCSV('TEST-123-123-csv');
 
                 const kvData = await KeyValueStore.getValue('TEST-123-123-csv');
-                expect(kvData).toEqual('hello,foo\nworld 1,bar 1\nworld 2,bar 2\n');
+                expect(kvData).toEqual('hello,foo\nworld 1,bar 1\nworld 2,bar 2\nworld 3,bar 3\n');
             });
         });
     });

@@ -1,10 +1,10 @@
+import { createHash } from 'node:crypto';
+
 import defaultLog from '@apify/log';
 import type * as storage from '@crawlee/types';
 import { s } from '@sapphire/shapeshift';
-import { createHash } from 'node:crypto';
+
 import { REQUEST_ID_LENGTH } from './consts';
-import type { InternalKeyRecord } from './resource-clients/key-value-store';
-import type { InternalRequest } from './resource-clients/request-queue';
 
 /**
  * Removes all properties with a null value
@@ -30,15 +30,11 @@ export function uniqueKeyToRequestId(uniqueKey: string): string {
         .replace(/(\+|\/|=)/g, '');
 
     return str.length > REQUEST_ID_LENGTH ? str.slice(0, REQUEST_ID_LENGTH) : str;
-};
+}
 
 export function isBuffer(value: unknown): boolean {
     try {
-        s.union(
-            s.typedArray(),
-            s.instance(ArrayBuffer),
-            s.instance(Buffer),
-        ).parse(value);
+        s.union(s.instance(Buffer), s.instance(ArrayBuffer), s.typedArray()).parse(value);
 
         return true;
     } catch {
@@ -46,40 +42,22 @@ export function isBuffer(value: unknown): boolean {
     }
 }
 
-export function isStream(value: unknown): boolean {
-    try {
-        s.object({
-            on: s.any,
-            pipe: s.any,
-        }).passthrough.parse(value);
-
-        return true;
-    } catch {
-        return false;
-    }
+export function isStream(value: any): boolean {
+    return (
+        typeof value === 'object' &&
+        value &&
+        ['on', 'pipe'].every((key) => key in value && typeof value[key] === 'function')
+    );
 }
 
 export const memoryStorageLog = defaultLog.child({ prefix: 'MemoryStorage' });
 
-export interface WorkerData {
-    datasetsDirectory: string;
-    keyValueStoresDirectory: string;
-    requestQueuesDirectory: string;
-}
+export type BackgroundHandlerReceivedMessage = BackgroundHandlerUpdateMetadataMessage;
 
-export type WorkerReceivedMessage = WorkerUpdateMetadataMessage | WorkerUpdateEntriesMessage | WorkerDeleteEntryMessage;
-
-export type WorkerUpdateMetadataMessage =
+export type BackgroundHandlerUpdateMetadataMessage =
     | MetadataUpdate<'datasets', storage.DatasetInfo>
     | MetadataUpdate<'keyValueStores', storage.KeyValueStoreInfo>
     | MetadataUpdate<'requestQueues', storage.RequestQueueInfo>;
-
-export type WorkerUpdateEntriesMessage =
-    | EntriesUpdate<'datasets', [string, storage.Dictionary][]>
-    | EntriesUpdate<'keyValueStores', KeyValueStoreItemData>
-    | EntriesUpdate<'requestQueues', InternalRequest>;
-
-export type WorkerDeleteEntryMessage = EntryDelete<'requestQueues'>;
 
 type EntityType = 'datasets' | 'keyValueStores' | 'requestQueues';
 
@@ -91,31 +69,4 @@ interface MetadataUpdate<Type extends EntityType, DataType> {
     data: DataType;
     writeMetadata: boolean;
     persistStorage: boolean;
-}
-
-interface EntriesUpdate<Type extends EntityType, DataType> {
-    entityType: Type;
-    id: string;
-    action: 'update-entries';
-    entityDirectory: string;
-    data: DataType;
-    writeMetadata: boolean;
-    persistStorage: boolean;
-}
-
-interface EntryDelete<Type extends EntityType> {
-    entityType: Type;
-    id: string;
-    action: 'delete-entry';
-    entityDirectory: string;
-    writeMetadata: boolean;
-    persistStorage: boolean;
-    data: {
-        id: string;
-    };
-}
-
-interface KeyValueStoreItemData {
-    action: 'set' | 'delete';
-    record: InternalKeyRecord;
 }

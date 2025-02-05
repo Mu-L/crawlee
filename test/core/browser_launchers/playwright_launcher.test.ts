@@ -1,18 +1,18 @@
 import fs from 'fs';
-import path from 'path';
-// @ts-expect-error no types
-import proxy from 'proxy';
 import type { Server } from 'http';
 import http from 'http';
+import type { AddressInfo } from 'net';
+import path from 'path';
 import util from 'util';
+
+import { BrowserLauncher, Configuration, launchPlaywright, PlaywrightLauncher } from '@crawlee/playwright';
+// @ts-expect-error no types
+import basicAuthParser from 'basic-auth-parser';
+import type { Browser, BrowserType } from 'playwright';
 // @ts-expect-error no types
 import portastic from 'portastic';
 // @ts-expect-error no types
-import basicAuthParser from 'basic-auth-parser';
-import { BrowserLauncher, Configuration, launchPlaywright, PlaywrightLauncher } from '@crawlee/playwright';
-
-import type { AddressInfo } from 'net';
-import type { Browser, BrowserType } from 'playwright';
+import proxy from 'proxy';
 import { runExampleComServer } from 'test/shared/_helper';
 
 let prevEnvHeadless: boolean;
@@ -35,7 +35,7 @@ beforeAll(async () => {
     serverAddress += port;
 
     // Find free port for the proxy
-    return portastic.find({ min: 50000, max: 50099 }).then((ports: number[]) => {
+    return portastic.find({ min: 50000, max: 50099 }).then(async (ports: number[]) => {
         return new Promise<void>((resolve, reject) => {
             const httpServer = http.createServer();
 
@@ -151,7 +151,7 @@ describe('launchPlaywright()', () => {
     });
 
     test('supports useChrome option', async () => {
-        const spy = jest.spyOn(BrowserLauncher.prototype as any, '_getTypicalChromeExecutablePath');
+        const spy = vitest.spyOn(BrowserLauncher.prototype as any, '_getTypicalChromeExecutablePath');
         let browser;
         const opts = {
             useChrome: true,
@@ -166,13 +166,12 @@ describe('launchPlaywright()', () => {
             // where pages would not load at all with Chrome.
             await page.goto(serverAddress);
             const title = await page.title();
-            const version = await browser.version();
+            const version = browser.version();
 
             expect(title).toBe('Example Domain');
             expect(version).not.toMatch('Chromium');
             expect(spy).toBeCalledTimes(1);
         } finally {
-            spy.mockRestore();
             if (browser) await browser.close();
         }
     }, 60e3);
@@ -194,7 +193,7 @@ describe('launchPlaywright()', () => {
             });
             const plugin = launcher.createBrowserPlugin();
 
-            expect(plugin!.launchOptions.executablePath).toEqual(target);
+            expect(plugin!.launchOptions!.executablePath).toEqual(target);
         });
 
         test('does not use default when using chrome', () => {
@@ -205,7 +204,6 @@ describe('launchPlaywright()', () => {
             const plugin = launcher.createBrowserPlugin();
 
             // @ts-expect-error private method
-            // eslint-disable-next-line no-underscore-dangle
             expect(plugin.launchOptions.executablePath).toBe(launcher._getTypicalChromeExecutablePath());
         }, 60e3);
 
@@ -220,7 +218,7 @@ describe('launchPlaywright()', () => {
             });
             const plugin = launcher.createBrowserPlugin();
 
-            expect(plugin.launchOptions.executablePath).toEqual(newPath);
+            expect(plugin.launchOptions!.executablePath).toEqual(newPath);
         });
 
         test('works without default path', async () => {

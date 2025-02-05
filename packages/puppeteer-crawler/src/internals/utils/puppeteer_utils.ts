@@ -19,22 +19,25 @@
  */
 
 import { readFile } from 'fs/promises';
-import ow from 'ow';
 import vm from 'vm';
+
 import { LruCache } from '@apify/datastructures';
-import type { ProtocolMapping } from 'devtools-protocol/types/protocol-mapping.js';
-import type { Page, HTTPResponse, ResponseForRequest, HTTPRequest as PuppeteerRequest } from 'puppeteer';
 import log_ from '@apify/log';
 import type { Request } from '@crawlee/browser';
-import { KeyValueStore, RequestState, validators } from '@crawlee/browser';
+import { KeyValueStore, RequestState, validators, Configuration } from '@crawlee/browser';
 import type { Dictionary, BatchAddRequestsResult } from '@crawlee/types';
-import type { CheerioRoot } from '@crawlee/utils';
+import { type CheerioRoot, expandShadowRoots, sleep } from '@crawlee/utils';
 import * as cheerio from 'cheerio';
-import type { EnqueueLinksByClickingElementsOptions } from '../enqueue-links/click-elements';
-import { enqueueLinksByClickingElements } from '../enqueue-links/click-elements';
+import type { ProtocolMapping } from 'devtools-protocol/types/protocol-mapping.js';
+import { getInjectableScript } from 'idcac-playwright';
+import ow from 'ow';
+import type { Page, HTTPResponse, ResponseForRequest, HTTPRequest as PuppeteerRequest } from 'puppeteer';
+
 import type { InterceptHandler } from './puppeteer_request_interception';
 import { addInterceptRequestHandler, removeInterceptRequestHandler } from './puppeteer_request_interception';
-import type { PuppeteerCrawlingContext } from '../puppeteer-crawler';
+import type { EnqueueLinksByClickingElementsOptions } from '../enqueue-links/click-elements';
+import { enqueueLinksByClickingElements } from '../enqueue-links/click-elements';
+import type { PuppeteerCrawlerOptions, PuppeteerCrawlingContext } from '../puppeteer-crawler';
 
 const jqueryPath = require.resolve('jquery');
 
@@ -54,11 +57,13 @@ export interface DirectNavigationOptions {
 
     /**
      * When to consider operation succeeded, defaults to `load`. Events can be either:
-     * - `'domcontentloaded'` - consider operation to be finished when the `DOMContentLoaded` event is fired.
-     * - `'load'` - consider operation to be finished when the `load` event is fired.
-     * - `'networkidle'` - consider operation to be finished when there are no network connections for at least `500` ms.
+     * - `domcontentloaded` - consider operation to be finished when the `DOMContentLoaded` event is fired.
+     * - `load` - consider operation to be finished when the `load` event is fired.
+     * - `networkidle0` - consider operation to be finished when there are no network connections for at least `500` ms.
+     * - `networkidle2` - consider operation to be finished when there are no more than 2 network connections for at least `500` ms.
+     * - `networkidle` - alias for `networkidle0`
      */
-    waitUntil?: 'domcontentloaded' | 'load' | 'networkidle';
+    waitUntil?: 'domcontentloaded' | 'load' | 'networkidle' | 'networkidle0' | 'networkidle2';
 
     /**
      * Referer header value. If provided it will take preference over the referer header value set by page.setExtraHTTPHeaders(headers).
@@ -116,9 +121,12 @@ const injectedFilesCache = new LruCache({ maxLength: MAX_INJECT_FILE_CACHE_SIZE 
 export async function injectFile(page: Page, filePath: string, options: InjectFileOptions = {}): Promise<unknown> {
     ow(page, ow.object.validate(validators.browserPage));
     ow(filePath, ow.string);
-    ow(options, ow.object.exactShape({
-        surviveNavigations: ow.optional.boolean,
-    }));
+    ow(
+        options,
+        ow.object.exactShape({
+            surviveNavigations: ow.optional.boolean,
+        }),
+    );
 
     let contents = injectedFilesCache.get(filePath);
     if (!contents) {
@@ -127,9 +135,11 @@ export async function injectFile(page: Page, filePath: string, options: InjectFi
     }
     const evalP = page.evaluate(contents);
     if (options.surviveNavigations) {
-        page.on('framenavigated',
-            () => page.evaluate(contents)
-                .catch((error) => log.warning('An error occurred during the script injection!', { error })));
+        page.on('framenavigated', async () =>
+            page
+                .evaluate(contents)
+                .catch((error) => log.warning('An error occurred during the script injection!', { error })),
+        );
     }
 
     return evalP;
@@ -161,7 +171,7 @@ export async function injectFile(page: Page, filePath: string, options: InjectFi
  * @param page Puppeteer [`Page`](https://pptr.dev/api/puppeteer.page) object.
  * @param [options.surviveNavigations] Opt-out option to disable the JQuery reinjection after navigation.
  */
-export function injectJQuery(page: Page, options?: { surviveNavigations?: boolean }): Promise<unknown> {
+export async function injectJQuery(page: Page, options?: { surviveNavigations?: boolean }): Promise<unknown> {
     ow(page, ow.object.validate(validators.browserPage));
     return injectFile(page, jqueryPath, { surviveNavigations: options?.surviveNavigations ?? true });
 }
@@ -176,10 +186,45 @@ export function injectJQuery(page: Page, options?: { surviveNavigations?: boolea
  * ```
  *
  * @param page Puppeteer [`Page`](https://pptr.dev/api/puppeteer.page) object.
+ * @param ignoreShadowRoots
  */
-export async function parseWithCheerio(page: Page): Promise<CheerioRoot> {
+export async function parseWithCheerio(
+    page: Page,
+    ignoreShadowRoots = false,
+    ignoreIframes = false,
+): Promise<CheerioRoot> {
     ow(page, ow.object.validate(validators.browserPage));
-    const pageContent = await page.content();
+
+    if (page.frames().length > 1 && !ignoreIframes) {
+        const frames = await page.$$('iframe');
+
+        await Promise.all(
+            frames.map(async (frame) => {
+                try {
+                    const iframe = await frame.contentFrame();
+                    if (iframe) {
+                        const contents = await iframe.content();
+
+                        await frame.evaluate((f, c) => {
+                            const replacementNode = document.createElement('div');
+                            replacementNode.innerHTML = c;
+                            replacementNode.className = 'crawlee-iframe-replacement';
+
+                            f.replaceWith(replacementNode);
+                        }, contents);
+                    }
+                } catch (error) {
+                    log.warning(`Failed to extract iframe content: ${error}`);
+                }
+            }),
+        );
+    }
+
+    const html = ignoreShadowRoots
+        ? null
+        : ((await page.evaluate(`(${expandShadowRoots.toString()})(document)`)) as string);
+    const pageContent = html || (await page.content());
+
     return cheerio.load(pageContent);
 }
 
@@ -227,15 +272,15 @@ export async function parseWithCheerio(page: Page): Promise<CheerioRoot> {
  */
 export async function blockRequests(page: Page, options: BlockRequestsOptions = {}): Promise<void> {
     ow(page, ow.object.validate(validators.browserPage));
-    ow(options, ow.object.exactShape({
-        urlPatterns: ow.optional.array.ofType(ow.string),
-        extraUrlPatterns: ow.optional.array.ofType(ow.string),
-    }));
+    ow(
+        options,
+        ow.object.exactShape({
+            urlPatterns: ow.optional.array.ofType(ow.string),
+            extraUrlPatterns: ow.optional.array.ofType(ow.string),
+        }),
+    );
 
-    const {
-        urlPatterns = DEFAULT_BLOCK_REQUEST_URL_PATTERNS,
-        extraUrlPatterns = [],
-    } = options;
+    const { urlPatterns = DEFAULT_BLOCK_REQUEST_URL_PATTERNS, extraUrlPatterns = [] } = options;
 
     const patternsToBlock = [...urlPatterns, ...extraUrlPatterns];
 
@@ -267,8 +312,9 @@ export async function sendCDPCommand<T extends keyof ProtocolMapping.Commands>(
     const jsonPath = require.resolve('puppeteer/package.json');
     const parsed = JSON.parse(await readFile(jsonPath, 'utf-8'));
 
-    // eslint-disable-next-line max-len
-    throw new Error(`Cannot detect CDP client for Puppeteer ${parsed.version}. You should report this to Crawlee, mentioning the puppeteer version you are using.`);
+    throw new Error(
+        `Cannot detect CDP client for Puppeteer ${parsed.version}. You should report this to Crawlee, mentioning the puppeteer version you are using.`,
+    );
 }
 
 /**
@@ -277,8 +323,10 @@ export async function sendCDPCommand<T extends keyof ProtocolMapping.Commands>(
  * @deprecated
  */
 export const blockResources = async (page: Page, resourceTypes = ['stylesheet', 'font', 'image', 'media']) => {
-    log.deprecated('utils.puppeteer.blockResources() has a high impact on performance in recent versions of Puppeteer. '
-        + 'Until this resolves, please use utils.puppeteer.blockRequests()');
+    log.deprecated(
+        'utils.puppeteer.blockResources() has a high impact on performance in recent versions of Puppeteer. ' +
+            'Until this resolves, please use utils.puppeteer.blockRequests()',
+    );
     await addInterceptRequestHandler(page, async (request) => {
         const type = request.resourceType();
         if (resourceTypes.includes(type)) await request.abort();
@@ -302,13 +350,19 @@ export const blockResources = async (page: Page, resourceTypes = ['stylesheet', 
  *   String rules are compared as page.url().includes(rule) while RegExp rules are evaluated as rule.test(page.url()).
  * @deprecated
  */
-export async function cacheResponses(page: Page, cache: Dictionary<Partial<ResponseForRequest>>, responseUrlRules: (string | RegExp)[]): Promise<void> {
+export async function cacheResponses(
+    page: Page,
+    cache: Dictionary<Partial<ResponseForRequest>>,
+    responseUrlRules: (string | RegExp)[],
+): Promise<void> {
     ow(page, ow.object.validate(validators.browserPage));
     ow(cache, ow.object);
     ow(responseUrlRules, ow.array.ofType(ow.any(ow.string, ow.regExp)));
 
-    log.deprecated('utils.puppeteer.cacheResponses() has a high impact on performance '
-        + 'in recent versions of Puppeteer so it\'s use is discouraged until this issue resolves.');
+    log.deprecated(
+        'utils.puppeteer.cacheResponses() has a high impact on performance ' +
+            "in recent versions of Puppeteer so it's use is discouraged until this issue resolves.",
+    );
 
     await addInterceptRequestHandler(page, async (request) => {
         const url = request.url();
@@ -343,7 +397,7 @@ export async function cacheResponses(page: Page, cache: Dictionary<Partial<Respo
                 };
             }
         } catch (e) {
-            // ignore errors, usualy means that buffer is empty or broken connection
+            // ignore errors, usually means that buffer is empty or broken connection
         }
     });
 }
@@ -402,23 +456,38 @@ export function compileScript(scriptString: string, context: Dictionary = Object
  * @param request
  * @param [gotoOptions] Custom options for `page.goto()`.
  */
-export async function gotoExtended(page: Page, request: Request, gotoOptions: DirectNavigationOptions = {}): Promise<HTTPResponse | null> {
+export async function gotoExtended(
+    page: Page,
+    request: Request,
+    gotoOptions: DirectNavigationOptions = {},
+): Promise<HTTPResponse | null> {
     ow(page, ow.object.validate(validators.browserPage));
-    ow(request, ow.object.partialShape({
-        url: ow.string.url,
-        method: ow.optional.string,
-        headers: ow.optional.object,
-        payload: ow.optional.any(ow.string, ow.buffer),
-    }));
+    ow(
+        request,
+        ow.object.partialShape({
+            url: ow.string.url,
+            method: ow.optional.string,
+            headers: ow.optional.object,
+            payload: ow.optional.any(ow.string, ow.uint8Array),
+        }),
+    );
     ow(gotoOptions, ow.object);
+
+    gotoOptions = { ...gotoOptions };
+
+    if (gotoOptions.waitUntil === 'networkidle') {
+        gotoOptions.waitUntil = 'networkidle0';
+    }
 
     const { url, method, headers, payload } = request;
     const isEmpty = (o?: object) => !o || Object.keys(o).length === 0;
 
     if (method !== 'GET' || payload || !isEmpty(headers)) {
         // This is not deprecated, we use it to log only once.
-        log.deprecated('Using other request methods than GET, rewriting headers and adding payloads has a high impact on performance '
-            + 'in recent versions of Puppeteer. Use only when necessary.');
+        log.deprecated(
+            'Using other request methods than GET, rewriting headers and adding payloads has a high impact on performance ' +
+                'in recent versions of Puppeteer. Use only when necessary.',
+        );
         let wasCalled = false;
         const interceptRequestHandler = async (interceptedRequest: PuppeteerRequest) => {
             // We want to ensure that this won't get executed again in a case that there is a subsequent request
@@ -446,9 +515,15 @@ export async function gotoExtended(page: Page, request: Request, gotoOptions: Di
 export interface InfiniteScrollOptions {
     /**
      * How many seconds to scroll for. If 0, will scroll until bottom of page.
-     * @default 1
+     * @default 0
      */
     timeoutSecs?: number;
+
+    /**
+     * How many pixels to scroll down. If 0, will scroll until bottom of page.
+     * @default 0
+     */
+    maxScrollHeight?: number;
 
     /**
      * How many seconds to wait for no new content to load before exit.
@@ -481,20 +556,32 @@ export interface InfiniteScrollOptions {
  */
 export async function infiniteScroll(page: Page, options: InfiniteScrollOptions = {}): Promise<void> {
     ow(page, ow.object.validate(validators.browserPage));
-    ow(options, ow.object.exactShape({
-        timeoutSecs: ow.optional.number,
-        waitForSecs: ow.optional.number,
-        scrollDownAndUp: ow.optional.boolean,
-        buttonSelector: ow.optional.string,
-        stopScrollCallback: ow.optional.function,
-    }));
+    ow(
+        options,
+        ow.object.exactShape({
+            timeoutSecs: ow.optional.number,
+            maxScrollHeight: ow.optional.number,
+            waitForSecs: ow.optional.number,
+            scrollDownAndUp: ow.optional.boolean,
+            buttonSelector: ow.optional.string,
+            stopScrollCallback: ow.optional.function,
+        }),
+    );
 
-    const { timeoutSecs = 0, waitForSecs = 4, scrollDownAndUp = false, buttonSelector, stopScrollCallback } = options;
+    const {
+        timeoutSecs = 0,
+        maxScrollHeight = 0,
+        waitForSecs = 4,
+        scrollDownAndUp = false,
+        buttonSelector,
+        stopScrollCallback,
+    } = options;
 
     let finished;
     const startTime = Date.now();
     const CHECK_INTERVAL_MILLIS = 1000;
     const SCROLL_HEIGHT_IF_ZERO = 10000;
+    let scrolledDistance = 0;
     const maybeResourceTypesInfiniteScroll = ['xhr', 'fetch', 'websocket', 'other'];
     const resourcesStats = {
         newRequested: 0,
@@ -513,7 +600,7 @@ export async function infiniteScroll(page: Page, options: InfiniteScrollOptions 
     let retry = 0;
 
     while (!body && retry < 10) {
-        await page.waitForTimeout(100);
+        await sleep(100);
         body = await page.$('body');
         retry++;
     }
@@ -545,6 +632,12 @@ export async function infiniteScroll(page: Page, options: InfiniteScrollOptions 
             clearInterval(checkFinished);
             finished = true;
         }
+
+        // check if max scroll height has been reached
+        if (maxScrollHeight > 0 && scrolledDistance > maxScrollHeight) {
+            clearInterval(checkFinished);
+            finished = true;
+        }
     }, CHECK_INTERVAL_MILLIS);
 
     const doScroll = async () => {
@@ -554,19 +647,20 @@ export async function infiniteScroll(page: Page, options: InfiniteScrollOptions 
         const delta = bodyScrollHeight === 0 ? SCROLL_HEIGHT_IF_ZERO : bodyScrollHeight;
 
         await page.mouse.wheel({ deltaY: delta });
+        scrolledDistance += delta;
     };
 
     const maybeClickButton = async () => {
         const button = await page.$(buttonSelector!);
         // Box model returns null if the button is not visible
-        if (button && await button.boxModel()) {
+        if (button && (await button.boxModel())) {
             await button.click({ delay: 10 });
         }
     };
 
     while (!finished) {
         await doScroll();
-        await page.waitForTimeout(250);
+        await sleep(250);
         if (scrollDownAndUp) {
             await page.mouse.wheel({ deltaY: -1000 });
         }
@@ -612,6 +706,12 @@ export interface SaveSnapshotOptions {
      * @default null
      */
     keyValueStoreName?: string | null;
+
+    /**
+     * Configuration of the crawler that will be used to save the snapshot.
+     * @default Configuration.getGlobalConfig()
+     */
+    config?: Configuration;
 }
 
 /**
@@ -621,13 +721,17 @@ export interface SaveSnapshotOptions {
  */
 export async function saveSnapshot(page: Page, options: SaveSnapshotOptions = {}): Promise<void> {
     ow(page, ow.object.validate(validators.browserPage));
-    ow(options, ow.object.exactShape({
-        key: ow.optional.string.nonEmpty,
-        screenshotQuality: ow.optional.number,
-        saveScreenshot: ow.optional.boolean,
-        saveHtml: ow.optional.boolean,
-        keyValueStoreName: ow.optional.string,
-    }));
+    ow(
+        options,
+        ow.object.exactShape({
+            key: ow.optional.string.nonEmpty,
+            screenshotQuality: ow.optional.number,
+            saveScreenshot: ow.optional.boolean,
+            saveHtml: ow.optional.boolean,
+            keyValueStoreName: ow.optional.string,
+            config: ow.optional.object,
+        }),
+    );
 
     const {
         key = 'SNAPSHOT',
@@ -635,14 +739,21 @@ export async function saveSnapshot(page: Page, options: SaveSnapshotOptions = {}
         saveScreenshot = true,
         saveHtml = true,
         keyValueStoreName,
+        config,
     } = options;
 
     try {
-        const store = await KeyValueStore.open(keyValueStoreName);
+        const store = await KeyValueStore.open(keyValueStoreName, {
+            config: config ?? Configuration.getGlobalConfig(),
+        });
 
         if (saveScreenshot) {
             const screenshotName = `${key}.jpg`;
-            const screenshotBuffer = await page.screenshot({ fullPage: true, quality: screenshotQuality, type: 'jpeg' });
+            const screenshotBuffer = await page.screenshot({
+                fullPage: true,
+                quality: screenshotQuality,
+                type: 'jpeg',
+            });
             await store.setValue(screenshotName, screenshotBuffer, { contentType: 'image/jpeg' });
         }
 
@@ -654,6 +765,10 @@ export async function saveSnapshot(page: Page, options: SaveSnapshotOptions = {}
     } catch (err) {
         throw new Error(`saveSnapshot with key ${key} failed.\nCause:${(err as Error).message}`);
     }
+}
+
+export async function closeCookieModals(page: Page): Promise<void> {
+    await page.evaluate(getInjectableScript());
 }
 
 /** @internal */
@@ -695,17 +810,33 @@ export interface PuppeteerContextUtils {
     injectJQuery(): Promise<unknown>;
 
     /**
-     * Returns Cheerio handle for `page.content()`, allowing to work with the data same way as with {@apilink CheerioCrawler}.
+     * Wait for an element matching the selector to appear.
+     * Timeout defaults to 5s.
      *
      * **Example usage:**
-     * ```javascript
+     * ```ts
+     * async requestHandler({ waitForSelector, parseWithCheerio }) {
+     *     await waitForSelector('article h1');
+     *     const $ = await parseWithCheerio();
+     *     const title = $('title').text();
+     * });
+     * ```
+     */
+    waitForSelector(selector: string, timeoutMs?: number): Promise<void>;
+
+    /**
+     * Returns Cheerio handle for `page.content()`, allowing to work with the data same way as with {@apilink CheerioCrawler}.
+     * When provided with the `selector` argument, it waits for it to be available first.
+     *
+     * **Example usage:**
+     * ```ts
      * async requestHandler({ parseWithCheerio }) {
      *     const $ = await parseWithCheerio();
      *     const title = $('title').text();
      * });
      * ```
      */
-    parseWithCheerio(): Promise<CheerioRoot>;
+    parseWithCheerio(selector?: string, timeoutMs?: number): Promise<CheerioRoot>;
 
     /**
      * The function finds elements matching a specific CSS selector in a Puppeteer page,
@@ -748,7 +879,9 @@ export interface PuppeteerContextUtils {
      *
      * @returns Promise that resolves to {@apilink BatchAddRequestsResult} object.
      */
-    enqueueLinksByClickingElements(options: Omit<EnqueueLinksByClickingElementsOptions, 'page' | 'requestQueue'>): Promise<BatchAddRequestsResult>;
+    enqueueLinksByClickingElements(
+        options: Omit<EnqueueLinksByClickingElementsOptions, 'page' | 'requestQueue'>,
+    ): Promise<BatchAddRequestsResult>;
 
     /**
      * Forces the Puppeteer browser tab to block loading URLs that match a provided pattern.
@@ -809,7 +942,10 @@ export interface PuppeteerContextUtils {
      *   String rules are compared as page.url().includes(rule) while RegExp rules are evaluated as rule.test(page.url()).
      * @deprecated
      */
-    cacheResponses(cache: Dictionary<Partial<ResponseForRequest>>, responseUrlRules: (string | RegExp)[]): Promise<void>;
+    cacheResponses(
+        cache: Dictionary<Partial<ResponseForRequest>>,
+        responseUrlRules: (string | RegExp)[],
+    ): Promise<void>;
 
     /**
      * Compiles a Puppeteer script into an async function that may be executed at any time
@@ -907,42 +1043,68 @@ export interface PuppeteerContextUtils {
      * Saves a full screenshot and HTML of the current page into a Key-Value store.
      */
     saveSnapshot(options?: SaveSnapshotOptions): Promise<void>;
+
+    /**
+     * Tries to close cookie consent modals on the page. Based on the I Don't Care About Cookies browser extension.
+     */
+    closeCookieModals(): Promise<void>;
 }
 
 /** @internal */
-export function registerUtilsToContext(context: PuppeteerCrawlingContext): void {
-    context.injectFile = (filePath: string, options?: InjectFileOptions) => injectFile(context.page, filePath, options);
-    context.injectJQuery = (async () => {
+export function registerUtilsToContext(
+    context: PuppeteerCrawlingContext,
+    crawlerOptions: PuppeteerCrawlerOptions,
+): void {
+    context.injectFile = async (filePath: string, options?: InjectFileOptions) =>
+        injectFile(context.page, filePath, options);
+    context.injectJQuery = async () => {
         if (context.request.state === RequestState.BEFORE_NAV) {
-            log.warning('Using injectJQuery() in preNavigationHooks leads to unstable results. Use it in a postNavigationHook or a requestHandler instead.');
+            log.warning(
+                'Using injectJQuery() in preNavigationHooks leads to unstable results. Use it in a postNavigationHook or a requestHandler instead.',
+            );
             await injectJQuery(context.page);
             return;
         }
         await injectJQuery(context.page, { surviveNavigations: false });
-    });
-    context.parseWithCheerio = () => parseWithCheerio(context.page);
-    context.enqueueLinksByClickingElements = (options: Omit<EnqueueLinksByClickingElementsOptions, 'page' | 'requestQueue'>) => enqueueLinksByClickingElements({
-        page: context.page,
-        requestQueue: context.crawler.requestQueue!,
-        ...options,
-    });
-    context.blockRequests = (options?: BlockRequestsOptions) => blockRequests(context.page, options);
-    context.blockResources = (resourceTypes?: string[]) => blockResources(context.page, resourceTypes);
-    context.cacheResponses = (cache: Dictionary<Partial<ResponseForRequest>>, responseUrlRules: (string | RegExp)[]) => {
+    };
+    context.waitForSelector = async (selector: string, timeoutMs = 5_000) => {
+        await context.page.waitForSelector(selector, { timeout: timeoutMs });
+    };
+    context.parseWithCheerio = async (selector?: string, timeoutMs = 5_000) => {
+        if (selector) {
+            await context.waitForSelector(selector, timeoutMs);
+        }
+
+        return parseWithCheerio(context.page, crawlerOptions.ignoreShadowRoots, crawlerOptions.ignoreIframes);
+    };
+    context.enqueueLinksByClickingElements = async (
+        options: Omit<EnqueueLinksByClickingElementsOptions, 'page' | 'requestQueue'>,
+    ) =>
+        enqueueLinksByClickingElements({
+            page: context.page,
+            requestQueue: context.crawler.requestQueue!,
+            ...options,
+        });
+    context.blockRequests = async (options?: BlockRequestsOptions) => blockRequests(context.page, options);
+    context.blockResources = async (resourceTypes?: string[]) => blockResources(context.page, resourceTypes);
+    context.cacheResponses = async (
+        cache: Dictionary<Partial<ResponseForRequest>>,
+        responseUrlRules: (string | RegExp)[],
+    ) => {
         return cacheResponses(context.page, cache, responseUrlRules);
     };
     context.compileScript = (scriptString: string, ctx?: Dictionary) => compileScript(scriptString, ctx);
-    context.addInterceptRequestHandler = (handler: InterceptHandler) => addInterceptRequestHandler(context.page, handler);
-    context.removeInterceptRequestHandler = (handler: InterceptHandler) => removeInterceptRequestHandler(context.page, handler);
-    context.infiniteScroll = (options?: InfiniteScrollOptions) => infiniteScroll(context.page, options);
-    context.saveSnapshot = (options?: SaveSnapshotOptions) => saveSnapshot(context.page, options);
+    context.addInterceptRequestHandler = async (handler: InterceptHandler) =>
+        addInterceptRequestHandler(context.page, handler);
+    context.removeInterceptRequestHandler = async (handler: InterceptHandler) =>
+        removeInterceptRequestHandler(context.page, handler);
+    context.infiniteScroll = async (options?: InfiniteScrollOptions) => infiniteScroll(context.page, options);
+    context.saveSnapshot = async (options?: SaveSnapshotOptions) =>
+        saveSnapshot(context.page, { ...options, config: context.crawler.config });
+    context.closeCookieModals = async () => closeCookieModals(context.page);
 }
 
-export {
-    enqueueLinksByClickingElements,
-    addInterceptRequestHandler,
-    removeInterceptRequestHandler,
-};
+export { enqueueLinksByClickingElements, addInterceptRequestHandler, removeInterceptRequestHandler };
 
 /** @internal */
 export const puppeteerUtils = {
@@ -959,4 +1121,5 @@ export const puppeteerUtils = {
     infiniteScroll,
     saveSnapshot,
     parseWithCheerio,
+    closeCookieModals,
 };

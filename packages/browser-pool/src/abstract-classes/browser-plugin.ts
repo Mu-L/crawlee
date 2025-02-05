@@ -1,9 +1,10 @@
-import merge from 'lodash.merge';
+import { CriticalError } from '@crawlee/core';
 import type { Dictionary } from '@crawlee/types';
+import merge from 'lodash.merge';
+
+import type { BrowserController } from './browser-controller';
 import type { LaunchContextOptions } from '../launch-context';
 import { LaunchContext } from '../launch-context';
-import type { BrowserController } from './browser-controller';
-import { throwImplementationNeeded } from './utils';
 import type { UnwrapPromise } from '../utils';
 
 /**
@@ -16,7 +17,8 @@ import type { UnwrapPromise } from '../utils';
  *
  * After you update it here, please update it also in jsdom-crawler.ts
  */
-export const DEFAULT_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36';
+export const DEFAULT_USER_AGENT =
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36';
 
 /**
  * Each plugin expects an instance of the object with the `.launch()` property.
@@ -73,6 +75,13 @@ export interface BrowserPluginOptions<LibraryOptions> {
      * Path to a User Data Directory, which stores browser session data like cookies and local storage.
      */
     userDataDir?: string;
+    /**
+     * If set to `true`, the crawler respects the proxy url generated for the given request.
+     * This aligns the browser-based crawlers with the `HttpCrawler`.
+     *
+     * Might cause performance issues, as Crawlee might launch too many browser instances.
+     */
+    browserPerProxy?: boolean;
 }
 
 export interface CreateLaunchContextOptions<
@@ -81,7 +90,12 @@ export interface CreateLaunchContextOptions<
     LaunchResult extends CommonBrowser = UnwrapPromise<ReturnType<Library['launch']>>,
     NewPageOptions = Parameters<LaunchResult['newPage']>[0],
     NewPageResult = UnwrapPromise<ReturnType<LaunchResult['newPage']>>,
-> extends Partial<Omit<LaunchContextOptions<Library, LibraryOptions, LaunchResult, NewPageOptions, NewPageResult>, 'browserPlugin'>> {}
+> extends Partial<
+        Omit<
+            LaunchContextOptions<Library, LibraryOptions, LaunchResult, NewPageOptions, NewPageResult>,
+            'browserPlugin'
+        >
+    > {}
 
 /**
  * The `BrowserPlugin` serves two purposes. First, it is the base class that
@@ -110,6 +124,8 @@ export abstract class BrowserPlugin<
 
     experimentalContainers: boolean;
 
+    browserPerProxy?: boolean;
+
     constructor(library: Library, options: BrowserPluginOptions<LibraryOptions> = {}) {
         const {
             launchOptions = {} as LibraryOptions,
@@ -117,6 +133,7 @@ export abstract class BrowserPlugin<
             userDataDir,
             useIncognitoPages = false,
             experimentalContainers = false,
+            browserPerProxy = false,
         } = options;
 
         this.library = library;
@@ -125,6 +142,7 @@ export abstract class BrowserPlugin<
         this.userDataDir = userDataDir;
         this.useIncognitoPages = useIncognitoPages;
         this.experimentalContainers = experimentalContainers;
+        this.browserPerProxy = browserPerProxy;
     }
 
     /**
@@ -143,6 +161,8 @@ export abstract class BrowserPlugin<
             useIncognitoPages = this.useIncognitoPages,
             userDataDir = this.userDataDir,
             experimentalContainers = this.experimentalContainers,
+            browserPerProxy = this.browserPerProxy,
+            proxyTier,
         } = options;
 
         return new LaunchContext({
@@ -153,6 +173,8 @@ export abstract class BrowserPlugin<
             useIncognitoPages,
             experimentalContainers,
             userDataDir,
+            browserPerProxy,
+            proxyTier,
         });
     }
 
@@ -164,7 +186,13 @@ export abstract class BrowserPlugin<
      * Launches the browser using provided launch context.
      */
     async launch(
-        launchContext: LaunchContext<Library, LibraryOptions, LaunchResult, NewPageOptions, NewPageResult> = this.createLaunchContext(),
+        launchContext: LaunchContext<
+            Library,
+            LibraryOptions,
+            LaunchResult,
+            NewPageOptions,
+            NewPageResult
+        > = this.createLaunchContext(),
     ): Promise<LaunchResult> {
         launchContext.launchOptions ??= {} as LibraryOptions;
 
@@ -203,37 +231,81 @@ export abstract class BrowserPlugin<
         }
 
         return originalArgs;
-    };
+    }
+
+    protected _throwAugmentedLaunchError(
+        cause: unknown,
+        executablePath: string | undefined,
+        dockerImage: string,
+        moduleInstallCommand: string,
+    ): never {
+        const errorMessage = ['Failed to launch browser. Please check the following:'];
+
+        if (executablePath) {
+            errorMessage.push(`- Check whether the provided executable path "${executablePath}" is correct.`);
+        }
+
+        if (process.env.APIFY_IS_AT_HOME) {
+            errorMessage.push(`- Make sure your Dockerfile extends ${dockerImage}.`);
+        }
+
+        errorMessage.push(`- ${moduleInstallCommand}`);
+
+        errorMessage.push(
+            '',
+            'The original error is available in the `cause` property. Below is the error received when trying to launch a browser:',
+            '',
+        );
+
+        // Add in a zero-width space so we can remove it later when printing the error stack
+        throw new BrowserLaunchError(`${errorMessage.join('\n')}\u200b`, { cause });
+    }
 
     /**
      * @private
      */
-    // @ts-expect-error Give runtime error as well as compile time
-    // eslint-disable-next-line max-len
-    protected abstract _addProxyToLaunchOptions(launchContext: LaunchContext<Library, LibraryOptions, LaunchResult, NewPageOptions, NewPageResult>): Promise<void> {
-        throwImplementationNeeded('_addProxyToLaunchOptions');
-    }
+    protected abstract _addProxyToLaunchOptions(
+        launchContext: LaunchContext<Library, LibraryOptions, LaunchResult, NewPageOptions, NewPageResult>,
+    ): Promise<void>;
 
-    // @ts-expect-error Give runtime error as well as compile time
-    // eslint-disable-next-line space-before-function-paren, @typescript-eslint/no-unused-vars, max-len
-    protected abstract _isChromiumBasedBrowser(launchContext: LaunchContext<Library, LibraryOptions, LaunchResult, NewPageOptions, NewPageResult>): boolean {
-        throwImplementationNeeded('_isChromiumBasedBrowser');
-    }
+    protected abstract _isChromiumBasedBrowser(
+        launchContext: LaunchContext<Library, LibraryOptions, LaunchResult, NewPageOptions, NewPageResult>,
+    ): boolean;
 
     /**
      * @private
      */
-    // @ts-expect-error Give runtime error as well as compile time
-    protected abstract _launch(launchContext: LaunchContext<Library, LibraryOptions, LaunchResult, NewPageOptions, NewPageResult>): Promise<LaunchResult> {
-        throwImplementationNeeded('_launch');
-    }
+    protected abstract _launch(
+        launchContext: LaunchContext<Library, LibraryOptions, LaunchResult, NewPageOptions, NewPageResult>,
+    ): Promise<LaunchResult>;
 
     /**
      * @private
      */
-    // @ts-expect-error Give runtime error as well as compile time
-    // eslint-disable-next-line space-before-function-paren
-    protected abstract _createController(): BrowserController<Library, LibraryOptions, LaunchResult, NewPageOptions, NewPageResult> {
-        throwImplementationNeeded('_createController');
+    protected abstract _createController(): BrowserController<
+        Library,
+        LibraryOptions,
+        LaunchResult,
+        NewPageOptions,
+        NewPageResult
+    >;
+}
+
+export class BrowserLaunchError extends CriticalError {
+    public constructor(...args: ConstructorParameters<typeof CriticalError>) {
+        super(...args);
+        this.name = 'BrowserLaunchError';
+
+        const [, oldStack] = this.stack?.split('\u200b') ?? [null, ''];
+
+        Object.defineProperty(this, 'stack', {
+            get: () => {
+                if (this.cause instanceof Error) {
+                    return `${this.message}\n${this.cause.stack}\nError thrown at:\n${oldStack}`;
+                }
+
+                return `${this.message}\n${oldStack}`;
+            },
+        });
     }
 }

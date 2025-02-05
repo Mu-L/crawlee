@@ -1,18 +1,23 @@
 import { Actor } from 'apify';
 import { Dataset, PuppeteerCrawler } from '@crawlee/puppeteer';
-import { ApifyStorageLocal } from '@apify/storage-local';
 
 const mainOptions = {
     exit: Actor.isAtHome(),
-    storage: process.env.STORAGE_IMPLEMENTATION === 'LOCAL' ? new ApifyStorageLocal() : undefined,
+    storage:
+        process.env.STORAGE_IMPLEMENTATION === 'LOCAL'
+            ? new (await import('@apify/storage-local')).ApifyStorageLocal()
+            : undefined,
 };
 
 await Actor.main(async () => {
     const crawler = new PuppeteerCrawler({
-        preNavigationHooks: [(_ctx, goToOptions) => {
-            goToOptions.waitUntil = ['networkidle2'];
-        }],
-        async requestHandler({ page, enqueueLinks, request }) {
+        preNavigationHooks: [
+            (_ctx, goToOptions) => {
+                goToOptions.waitUntil = ['networkidle2'];
+            },
+        ],
+        async requestHandler({ page, enqueueLinks, request, infiniteScroll }) {
+            await infiniteScroll();
             const { url } = request;
             const pageTitle = await page.title();
             await Dataset.pushData({ url, pageTitle });

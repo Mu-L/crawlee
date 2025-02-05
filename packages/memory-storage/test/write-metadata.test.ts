@@ -1,6 +1,8 @@
-import { MemoryStorage } from '@crawlee/memory-storage';
 import { readdir, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
+
+import { MemoryStorage } from '@crawlee/memory-storage';
+
 import { waitTillWrittenToDisk } from './__shared__';
 
 describe('writeMetadata option', () => {
@@ -22,7 +24,7 @@ describe('writeMetadata option', () => {
             const expectedPath = resolve(storage.keyValueStoresDirectory, `${keyValueStore.id}`);
 
             // We check that reading the directory for the store throws an error, which means it wasn't created on disk
-            await expect(() => readdir(expectedPath)).rejects.toThrow();
+            await expect(async () => readdir(expectedPath)).rejects.toThrow();
         });
 
         test('creating a key-value pair in a key-value store should not write __metadata__.json file for the value', async () => {
@@ -64,7 +66,10 @@ describe('writeMetadata option', () => {
             await keyValueStore.setRecord({ key: 'foo', value: 'test' });
 
             const expectedFilePath = resolve(storage.keyValueStoresDirectory, `${keyValueStoreInfo.id}/foo.txt`);
-            const expectedMetadataPath = resolve(storage.keyValueStoresDirectory, `${keyValueStoreInfo.id}/foo.__metadata__.json`);
+            const expectedMetadataPath = resolve(
+                storage.keyValueStoresDirectory,
+                `${keyValueStoreInfo.id}/foo.__metadata__.json`,
+            );
             await Promise.all([waitTillWrittenToDisk(expectedFilePath), waitTillWrittenToDisk(expectedMetadataPath)]);
 
             const directoryFiles = await readdir(resolve(storage.keyValueStoresDirectory, `${keyValueStoreInfo.id}`));

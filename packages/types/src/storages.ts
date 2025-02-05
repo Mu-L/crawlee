@@ -5,7 +5,6 @@ import type { AllowedHttpMethods, Dictionary } from './utility-types';
  * {@apilink RequestQueue} functions as well as {@apilink enqueueLinks}.
  */
 export interface QueueOperationInfo {
-
     /** Indicates if request was already present in the queue. */
     wasAlreadyPresent: boolean;
 
@@ -14,7 +13,6 @@ export interface QueueOperationInfo {
 
     /** The ID of the added request */
     requestId: string;
-
 }
 
 export interface DatasetCollectionClientOptions {
@@ -34,7 +32,7 @@ export interface DatasetCollectionData {
  */
 export interface DatasetCollectionClient {
     list(): Promise<PaginatedList<Dataset>>;
-    getOrCreate(name: string): Promise<DatasetCollectionData>;
+    getOrCreate(name?: string): Promise<DatasetCollectionData>;
 }
 
 export interface Dataset extends DatasetCollectionData {
@@ -162,6 +160,7 @@ export interface KeyValueStoreClient {
     update(newFields: KeyValueStoreClientUpdateOptions): Promise<Partial<KeyValueStoreInfo>>;
     delete(): Promise<void>;
     listKeys(options?: KeyValueStoreClientListOptions): Promise<KeyValueStoreClientListData>;
+    recordExists(key: string): Promise<boolean>;
     getRecord(key: string, options?: KeyValueStoreClientGetRecordOptions): Promise<KeyValueStoreRecord | undefined>;
     setRecord(record: KeyValueStoreRecord): Promise<void>;
     deleteRecord(key: string): Promise<void>;
@@ -215,16 +214,32 @@ export interface RequestQueueStats {
     storageBytes?: number;
 }
 
-export interface RequestQueueClientOptions {
-    name: string;
-    storageDir: string;
-}
-
 export interface ListOptions {
     /**
      * @default 100
      */
     limit?: number;
+}
+
+export interface ListAndLockOptions extends ListOptions {
+    lockSecs: number;
+}
+
+export interface ListAndLockHeadResult extends QueueHead {
+    lockSecs: number;
+}
+
+export interface ProlongRequestLockOptions {
+    lockSecs: number;
+    forefront?: boolean;
+}
+
+export interface ProlongRequestLockResult {
+    lockExpiresAt: Date;
+}
+
+export interface DeleteRequestLockOptions {
+    forefront?: boolean;
 }
 
 export interface RequestOptions {
@@ -278,12 +293,20 @@ export interface RequestQueueClient {
     batchAddRequests(requests: RequestSchema[], options?: RequestOptions): Promise<BatchAddRequestsResult>;
     getRequest(id: string): Promise<RequestOptions | undefined>;
     updateRequest(request: UpdateRequestSchema, options?: RequestOptions): Promise<QueueOperationInfo>;
-    deleteRequest(_id: string): Promise<unknown>;
+    deleteRequest(id: string): Promise<unknown>;
+    listAndLockHead(options: ListAndLockOptions): Promise<ListAndLockHeadResult>;
+    prolongRequestLock(id: string, options: ProlongRequestLockOptions): Promise<ProlongRequestLockResult>;
+    deleteRequestLock(id: string, options?: DeleteRequestLockOptions): Promise<void>;
 }
 
 export interface RequestQueueOptions {
     clientKey?: string;
     timeoutSecs?: number;
+}
+
+export interface SetStatusMessageOptions {
+    isStatusMessageTerminal?: boolean;
+    level?: 'DEBUG' | 'INFO' | 'WARNING' | 'ERROR';
 }
 
 /**
@@ -298,5 +321,6 @@ export interface StorageClient {
     requestQueue(id: string, options?: RequestQueueOptions): RequestQueueClient;
     purge?(): Promise<void>;
     teardown?(): Promise<void>;
+    setStatusMessage?(message: string, options?: SetStatusMessageOptions): Promise<void>;
     stats?: { rateLimitErrors: number[] };
 }

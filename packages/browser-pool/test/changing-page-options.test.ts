@@ -1,26 +1,31 @@
-import type { PrePageCreateHook, PuppeteerController, PlaywrightController } from '@crawlee/browser-pool';
-import { BrowserPool, PuppeteerPlugin, PlaywrightPlugin } from '@crawlee/browser-pool';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
-import puppeteer from 'puppeteer';
+import { promisify } from 'node:util';
+
+import type { PrePageCreateHook, PuppeteerController, PlaywrightController } from '@crawlee/browser-pool';
+import { BrowserPool, PuppeteerPlugin, PlaywrightPlugin } from '@crawlee/browser-pool';
 import playwright from 'playwright';
 import type { Server as ProxyChainServer } from 'proxy-chain';
-import { promisify } from 'node:util';
+import puppeteer from 'puppeteer';
+
 import { createProxyServer } from '../../../test/browser-pool/browser-plugins/create-proxy-server';
 
 describe.each([
     ['Puppeteer', new PuppeteerPlugin(puppeteer, { useIncognitoPages: true })],
-    ['Playwright', new PlaywrightPlugin(playwright.chromium, {
-        useIncognitoPages: true,
-        launchOptions: {
-            args: [
-                // Exclude loopback interface from proxy bypass list,
-                // so the request to localhost goes through proxy.
-                // This way there's no need for a 3rd party server.
-                '--proxy-bypass-list=<-loopback>',
-            ],
-        },
-    })], // Chromium is faster than firefox and webkit
+    [
+        'Playwright',
+        new PlaywrightPlugin(playwright.chromium, {
+            useIncognitoPages: true,
+            launchOptions: {
+                args: [
+                    // Exclude loopback interface from proxy bypass list,
+                    // so the request to localhost goes through proxy.
+                    // This way there's no need for a 3rd party server.
+                    '--proxy-bypass-list=<-loopback>',
+                ],
+            },
+        }),
+    ], // Chromium is faster than firefox and webkit
 ])('BrowserPool - %s - prePageCreateHooks > should allow changing pageOptions', (_, plugin) => {
     let target: http.Server;
     let protectedProxy: ProxyChainServer;
@@ -42,7 +47,11 @@ describe.each([
     });
 
     test('should allow changing pageOptions', async () => {
-        const hook: PrePageCreateHook<PlaywrightController | PuppeteerController> = (_pageId, _controller, pageOptions) => {
+        const hook: PrePageCreateHook<PlaywrightController | PuppeteerController> = (
+            _pageId,
+            _controller,
+            pageOptions,
+        ) => {
             if (!pageOptions) {
                 expect(false).toBe(true);
                 return;

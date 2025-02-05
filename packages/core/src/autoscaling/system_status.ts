@@ -1,5 +1,6 @@
-import ow from 'ow';
 import { weightedAvg } from '@crawlee/utils';
+import ow from 'ow';
+
 import { Snapshotter } from './snapshotter';
 import type { Configuration } from '../configuration';
 
@@ -7,7 +8,7 @@ import type { Configuration } from '../configuration';
  * Represents the current status of the system.
  */
 export interface SystemInfo {
-    /** If true, system is being overloaded. */
+    /** If false, system is being overloaded. */
     isSystemIdle: boolean;
     memInfo: ClientInfo;
     eventLoopInfo: ClientInfo;
@@ -117,7 +118,7 @@ export interface FinalStatistics {
  * @category Scaling
  */
 export class SystemStatus {
-    private readonly currentHistorySecs: number;
+    private readonly currentHistoryMillis: number;
     private readonly maxMemoryOverloadedRatio: number;
     private readonly maxEventLoopOverloadedRatio: number;
     private readonly maxCpuOverloadedRatio: number;
@@ -125,15 +126,18 @@ export class SystemStatus {
     private readonly snapshotter: Snapshotter;
 
     constructor(options: SystemStatusOptions = {}) {
-        ow(options, ow.object.exactShape({
-            currentHistorySecs: ow.optional.number,
-            maxMemoryOverloadedRatio: ow.optional.number,
-            maxEventLoopOverloadedRatio: ow.optional.number,
-            maxCpuOverloadedRatio: ow.optional.number,
-            maxClientOverloadedRatio: ow.optional.number,
-            snapshotter: ow.optional.object,
-            config: ow.optional.object,
-        }));
+        ow(
+            options,
+            ow.object.exactShape({
+                currentHistorySecs: ow.optional.number,
+                maxMemoryOverloadedRatio: ow.optional.number,
+                maxEventLoopOverloadedRatio: ow.optional.number,
+                maxCpuOverloadedRatio: ow.optional.number,
+                maxClientOverloadedRatio: ow.optional.number,
+                snapshotter: ow.optional.object,
+                config: ow.optional.object,
+            }),
+        );
 
         const {
             currentHistorySecs = 5,
@@ -145,7 +149,7 @@ export class SystemStatus {
             config,
         } = options;
 
-        this.currentHistorySecs = currentHistorySecs * 1000;
+        this.currentHistoryMillis = currentHistorySecs * 1000;
         this.maxMemoryOverloadedRatio = maxMemoryOverloadedRatio;
         this.maxEventLoopOverloadedRatio = maxEventLoopOverloadedRatio;
         this.maxCpuOverloadedRatio = maxCpuOverloadedRatio;
@@ -170,7 +174,7 @@ export class SystemStatus {
      * and `true` otherwise.
      */
     getCurrentStatus(): SystemInfo {
-        return this._isSystemIdle(this.currentHistorySecs);
+        return this._isSystemIdle(this.currentHistoryMillis);
     }
 
     /**
@@ -202,7 +206,11 @@ export class SystemStatus {
         const cpuInfo = this._isCpuOverloaded(sampleDurationMillis);
         const clientInfo = this._isClientOverloaded(sampleDurationMillis);
         return {
-            isSystemIdle: !memInfo.isOverloaded && !eventLoopInfo.isOverloaded && !cpuInfo.isOverloaded && !clientInfo.isOverloaded,
+            isSystemIdle:
+                !memInfo.isOverloaded &&
+                !eventLoopInfo.isOverloaded &&
+                !cpuInfo.isOverloaded &&
+                !clientInfo.isOverloaded,
             memInfo,
             eventLoopInfo,
             cpuInfo,
@@ -250,7 +258,10 @@ export class SystemStatus {
      * Returns an object with sample information and an isOverloaded property
      * set to true if at least the ratio of snapshots in the sample are overloaded.
      */
-    protected _isSampleOverloaded<T extends { createdAt: Date; isOverloaded: boolean }>(sample: T[], ratio: number): ClientInfo {
+    protected _isSampleOverloaded<T extends { createdAt: Date; isOverloaded: boolean }>(
+        sample: T[],
+        ratio: number,
+    ): ClientInfo {
         if (sample.length === 0) {
             return {
                 isOverloaded: false,

@@ -1,6 +1,8 @@
-import { HttpCrawler } from '@crawlee/http';
-import type { AddressInfo } from 'node:net';
 import http from 'node:http';
+import type { AddressInfo } from 'node:net';
+import { Readable } from 'node:stream';
+
+import { HttpCrawler } from '@crawlee/http';
 import { MemoryStorageEmulator } from 'test/shared/MemoryStorageEmulator';
 
 const router = new Map<string, http.RequestListener>();
@@ -46,27 +48,40 @@ router.set('/echo', (req, res) => {
     req.pipe(res);
 });
 
+router.set('/500Error', (req, res) => {
+    res.statusCode = 500;
+    res.end();
+});
+
+router.set('/403-with-octet-stream', (req, res) => {
+    res.setHeader('content-type', 'application/octet-stream');
+    res.statusCode = 403;
+    res.end();
+});
+
 let server: http.Server;
 let url: string;
 
-beforeAll((cb) => {
+beforeAll(async () => {
     server = http.createServer((request, response) => {
         try {
-            const requestUrl = new URL(request.url, 'http://localhost');
-            router.get(requestUrl.pathname)(request, response);
+            const requestUrl = new URL(request.url!, 'http://localhost');
+            router.get(requestUrl.pathname)!(request, response);
         } catch (error) {
             response.destroy();
         }
     });
 
-    server.listen(() => {
-        url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-        cb();
-    });
+    await new Promise<void>((resolve) =>
+        server.listen(() => {
+            url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+            resolve();
+        }),
+    );
 });
 
-afterAll((cb) => {
-    server.close(cb);
+afterAll(async () => {
+    await new Promise((resolve) => server.close(resolve));
 });
 
 const localStorageEmulator = new MemoryStorageEmulator();
@@ -92,6 +107,22 @@ test('works', async () => {
     await crawler.run([url]);
 
     expect(results[0].includes('Example Domain')).toBeTruthy();
+});
+
+test('parseWithCheerio works', async () => {
+    const results: string[] = [];
+
+    const crawler = new HttpCrawler({
+        maxRequestRetries: 0,
+        requestHandler: async ({ parseWithCheerio }) => {
+            const $ = await parseWithCheerio('title');
+            results.push($('title').text());
+        },
+    });
+
+    await crawler.run([`${url}/hello.html`]);
+
+    expect(results).toStrictEqual(['Example Domain']);
 });
 
 test('should parse content type from header', async () => {
@@ -190,9 +221,7 @@ test('handles cookies from redirects', async () => {
 
     await crawler.run([`${url}/redirectAndCookies`]);
 
-    expect(results).toStrictEqual([
-        'foo=bar',
-    ]);
+    expect(results).toStrictEqual(['foo=bar']);
 });
 
 test('handles cookies from redirects - no empty cookie header', async () => {
@@ -255,4 +284,174 @@ test('POST with undefined (empty) payload', async () => {
     ]);
 
     expect(results).toStrictEqual(['']);
+});
+
+test('should ignore http error status codes set by user', async () => {
+    const failed: any[] = [];
+
+    const crawler = new HttpCrawler({
+        minConcurrency: 2,
+        maxConcurrency: 2,
+        ignoreHttpErrorStatusCodes: [500],
+        requestHandler: () => {},
+        failedRequestHandler: ({ request }) => {
+            failed.push(request);
+        },
+    });
+
+    await crawler.run([`${url}/500Error`]);
+
+    expect(crawler.autoscaledPool!.minConcurrency).toBe(2);
+    expect(failed).toHaveLength(0);
+});
+
+test('should throw an error on http error status codes set by user', async () => {
+    const failed: any[] = [];
+
+    const crawler = new HttpCrawler({
+        minConcurrency: 2,
+        maxConcurrency: 2,
+        additionalHttpErrorStatusCodes: [200],
+        requestHandler: () => {},
+        failedRequestHandler: ({ request }) => {
+            failed.push(request);
+        },
+    });
+
+    await crawler.run([`${url}/hello.html`]);
+
+    expect(crawler.autoscaledPool!.minConcurrency).toBe(2);
+    expect(failed).toHaveLength(1);
+});
+
+test('should work with delete requests', async () => {
+    const failed: any[] = [];
+
+    const cheerioCrawler = new HttpCrawler({
+        maxConcurrency: 1,
+        maxRequestRetries: 0,
+        navigationTimeoutSecs: 5,
+        requestHandlerTimeoutSecs: 5,
+        requestHandler: async () => {},
+        failedRequestHandler: async ({ request }) => {
+            failed.push(request);
+        },
+    });
+
+    await cheerioCrawler.run([
+        {
+            url: `${url}`,
+            method: 'DELETE',
+        },
+    ]);
+
+    expect(failed).toHaveLength(0);
+});
+
+test('should retry on 403 even with disallowed content-type', async () => {
+    const succeeded: any[] = [];
+
+    const crawler = new HttpCrawler({
+        maxConcurrency: 1,
+        maxRequestRetries: 1,
+        preNavigationHooks: [
+            async ({ request }) => {
+                // mock 403 response with octet stream on first request attempt, but not on
+                // subsequent retries, so the request should eventually succeed
+                if (request.retryCount === 0) {
+                    request.url = `${url}/403-with-octet-stream`;
+                } else {
+                    request.url = url;
+                }
+            },
+        ],
+        requestHandler: async ({ request }) => {
+            succeeded.push(request);
+        },
+    });
+
+    await crawler.run([url]);
+
+    expect(succeeded).toHaveLength(1);
+    expect(succeeded[0].retryCount).toBe(1);
+});
+
+test('should work with cacheable-request', async () => {
+    const isFromCache: Record<string, boolean> = {};
+    const cache = new Map();
+    const crawler = new HttpCrawler({
+        maxConcurrency: 1,
+        preNavigationHooks: [
+            async (_, gotOptions) => {
+                gotOptions.cache = cache;
+                gotOptions.headers = {
+                    ...gotOptions.headers,
+                    // to force cache
+                    'cache-control': 'max-stale',
+                };
+            },
+        ],
+        requestHandler: async ({ request, response }) => {
+            isFromCache[request.uniqueKey] = response.isFromCache;
+        },
+    });
+    await crawler.run([
+        { url, uniqueKey: 'first' },
+        { url, uniqueKey: 'second' },
+    ]);
+    expect(isFromCache).toEqual({ first: false, second: true });
+});
+
+test('works with a custom HttpClient', async () => {
+    const results: string[] = [];
+
+    const crawler = new HttpCrawler({
+        maxRequestRetries: 0,
+        requestHandler: async ({ body, sendRequest }) => {
+            results.push(body as string);
+
+            results.push((await sendRequest()).body);
+        },
+        httpClient: {
+            async sendRequest(request) {
+                if (request.responseType !== 'text') {
+                    throw new Error('Not implemented');
+                }
+
+                return {
+                    body: 'Hello from sendRequest()' as any,
+                    request,
+                    url,
+                    redirectUrls: [],
+                    statusCode: 200,
+                    headers: {},
+                    trailers: {},
+                    complete: true,
+                };
+            },
+            async stream(request) {
+                const stream = new Readable();
+                stream.push('<html><head><title>Schmexample Domain</title></head></html>');
+                stream.push(null);
+
+                return {
+                    stream,
+                    downloadProgress: { percent: 100, transferred: 0 },
+                    uploadProgress: { percent: 100, transferred: 0 },
+                    request,
+                    url,
+                    redirectUrls: [],
+                    statusCode: 200,
+                    headers: { 'content-type': 'text/html; charset=utf-8' },
+                    trailers: {},
+                    complete: true,
+                };
+            },
+        },
+    });
+
+    await crawler.run([url]);
+
+    expect(results[0].includes('Schmexample Domain')).toBeTruthy();
+    expect(results[1].includes('Hello')).toBeTruthy();
 });

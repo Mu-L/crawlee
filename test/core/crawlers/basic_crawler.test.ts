@@ -1,11 +1,12 @@
+import { mkdir, mkdtemp } from 'fs/promises';
 import type { Server } from 'http';
 import http from 'http';
 import type { AddressInfo } from 'net';
+import { readFile, rm } from 'node:fs/promises';
+import { join } from 'path';
+
 import log from '@apify/log';
-import type {
-    CrawlingContext,
-    ErrorHandler,
-    RequestHandler } from '@crawlee/basic';
+import type { CrawlingContext, ErrorHandler, RequestHandler } from '@crawlee/basic';
 import {
     Request,
     RequestQueue,
@@ -18,23 +19,13 @@ import {
     CriticalError,
     MissingRouteError,
 } from '@crawlee/basic';
-import {
-    AutoscaledPool, RequestState,
-} from '@crawlee/core';
-import express from 'express';
+import { RequestState } from '@crawlee/core';
 import type { Dictionary } from '@crawlee/utils';
 import { sleep } from '@crawlee/utils';
+import express from 'express';
 import { MemoryStorageEmulator } from 'test/shared/MemoryStorageEmulator';
-import { startExpressAppPromise } from '../../shared/_helper';
 
-jest.mock('@crawlee/core', () => {
-    const originalModule = jest.requireActual('@crawlee/core');
-    const AutoscaledPoolMockConstructor = jest.fn((...args) => new originalModule.AutoscaledPool(...args));
-    return {
-        ...originalModule,
-        AutoscaledPool: AutoscaledPoolMockConstructor,
-    };
-});
+import { startExpressAppPromise } from '../../shared/_helper';
 
 describe('BasicCrawler', () => {
     let logLevel: number;
@@ -61,7 +52,7 @@ describe('BasicCrawler', () => {
     });
 
     beforeEach(async () => {
-        jest.clearAllMocks();
+        vitest.clearAllMocks();
         await localStorageEmulator.init();
     });
 
@@ -111,24 +102,40 @@ describe('BasicCrawler', () => {
 
         await basicCrawler.run();
 
-        expect(basicCrawler.autoscaledPool.minConcurrency).toBe(25);
+        expect(basicCrawler.autoscaledPool!.minConcurrency).toBe(25);
         expect(processed).toEqual(sourcesCopy);
         expect(await requestList.isFinished()).toBe(true);
         expect(await requestList.isEmpty()).toBe(true);
     });
 
+    test('should allow using run method multiple times', async () => {
+        const sources = [...Array(100).keys()].map((index) => `https://example.com/${index}`);
+        const sourcesCopy = JSON.parse(JSON.stringify(sources));
+
+        const processed: { url: string }[] = [];
+        const requestHandler: RequestHandler = async ({ request }) => {
+            await sleep(10);
+            processed.push({ url: request.url });
+        };
+
+        const basicCrawler = new BasicCrawler({
+            minConcurrency: 25,
+            maxConcurrency: 25,
+            requestHandler,
+        });
+
+        await basicCrawler.run(sources);
+        await basicCrawler.run(sources);
+        await basicCrawler.run(sources);
+
+        expect(processed).toHaveLength(sourcesCopy.length * 3);
+    });
+
     test('should correctly combine shorthand and full length options', async () => {
         const shorthandOptions = {
-            options: {
-                minConcurrency: 123,
-                maxConcurrency: 456,
-                maxRequestsPerMinute: 789,
-            },
-            compare: {
-                minConcurrency: 123,
-                maxConcurrency: 456,
-                maxTasksPerMinute: 789,
-            },
+            minConcurrency: 123,
+            maxConcurrency: 456,
+            maxRequestsPerMinute: 789,
         };
 
         const autoscaledPoolOptions = {
@@ -137,33 +144,49 @@ describe('BasicCrawler', () => {
             maxTasksPerMinute: 64,
         };
 
+        const collectResults = (crawler: BasicCrawler): typeof shorthandOptions | typeof autoscaledPoolOptions => {
+            return {
+                minConcurrency: crawler.autoscaledPool!.minConcurrency,
+                maxConcurrency: crawler.autoscaledPool!.maxConcurrency,
+                // eslint-disable-next-line dot-notation -- accessing a private member
+                maxRequestsPerMinute: crawler.autoscaledPool!['maxTasksPerMinute'],
+                // eslint-disable-next-line dot-notation
+                maxTasksPerMinute: crawler.autoscaledPool!['maxTasksPerMinute'],
+            };
+        };
+
         const requestList = await RequestList.open(null, []);
         const requestHandler = async () => {};
 
-        await (new BasicCrawler({
-            requestList,
-            requestHandler,
-            ...shorthandOptions.options,
-        })).run();
+        const results = await Promise.all(
+            [
+                new BasicCrawler({
+                    requestList,
+                    requestHandler,
+                    ...shorthandOptions,
+                }),
+                new BasicCrawler({
+                    requestList,
+                    requestHandler,
+                    autoscaledPoolOptions,
+                }),
+                new BasicCrawler({
+                    requestList,
+                    requestHandler,
+                    ...shorthandOptions,
+                    autoscaledPoolOptions,
+                }),
+            ].map(async (c) => {
+                await c.run();
+                return collectResults(c);
+            }),
+        );
 
-        expect((AutoscaledPool as any).mock.calls[0][0]).toMatchObject(shorthandOptions.compare);
+        expect(results[0]).toEqual(expect.objectContaining(shorthandOptions));
 
-        await (new BasicCrawler({
-            requestList,
-            requestHandler,
-            autoscaledPoolOptions,
-        })).run();
+        expect(results[1]).toEqual(expect.objectContaining(autoscaledPoolOptions));
 
-        expect((AutoscaledPool as any).mock.calls[1][0]).toMatchObject(autoscaledPoolOptions);
-
-        await (new BasicCrawler({
-            requestList,
-            requestHandler,
-            ...shorthandOptions.options,
-            autoscaledPoolOptions,
-        })).run();
-
-        expect((AutoscaledPool as any).mock.calls[2][0]).toMatchObject(shorthandOptions.compare);
+        expect(results[2]).toEqual(expect.objectContaining(shorthandOptions));
     });
 
     test('auto-saved state object', async () => {
@@ -194,56 +217,61 @@ describe('BasicCrawler', () => {
         expect(await requestList.isEmpty()).toBe(true);
     });
 
-    test.each([EventType.MIGRATING, EventType.ABORTING])('should pause on %s event and persist RequestList state', async (event) => {
-        const sources = [...Array(500).keys()].map((index) => ({ url: `https://example.com/${index + 1}` }));
+    test.each([EventType.MIGRATING, EventType.ABORTING])(
+        'should pause on %s event and persist RequestList state',
+        async (event) => {
+            const sources = [...Array(500).keys()].map((index) => ({ url: `https://example.com/${index + 1}` }));
 
-        let persistResolve: (value?: unknown) => void;
-        const persistPromise = new Promise((res) => { persistResolve = res; });
+            let persistResolve!: (value?: unknown) => void;
+            const persistPromise = new Promise((res) => {
+                persistResolve = res;
+            });
 
-        // Mock the calls to persist sources.
-        const getValueSpy = jest.spyOn(KeyValueStore.prototype, 'getValue');
-        const setValueSpy = jest.spyOn(KeyValueStore.prototype, 'setValue');
-        getValueSpy.mockResolvedValue(null);
+            // Mock the calls to persist sources.
+            const getValueSpy = vitest.spyOn(KeyValueStore.prototype, 'getValue');
+            const setValueSpy = vitest.spyOn(KeyValueStore.prototype, 'setValue');
+            getValueSpy.mockResolvedValue(null);
 
-        const processed: { url: string }[] = [];
-        const requestList = await RequestList.open('reqList', sources);
-        const requestHandler: RequestHandler = async ({ request }) => {
-            if (request.url.endsWith('200')) events.emit(event);
-            processed.push({ url: request.url });
-        };
+            const processed: { url: string }[] = [];
+            const requestList = await RequestList.open('reqList', sources);
+            const requestHandler: RequestHandler = async ({ request }) => {
+                if (request.url.endsWith('200')) events.emit(event);
+                processed.push({ url: request.url });
+            };
 
-        const basicCrawler = new BasicCrawler({
-            requestList,
-            minConcurrency: 25,
-            maxConcurrency: 25,
-            requestHandler,
-        });
+            const basicCrawler = new BasicCrawler({
+                requestList,
+                minConcurrency: 25,
+                maxConcurrency: 25,
+                requestHandler,
+            });
 
-        let finished = false;
-        // Mock the call to persist state.
-        setValueSpy.mockImplementationOnce(persistResolve as any);
-        // The crawler will pause after 200 requests
-        const runPromise = basicCrawler.run();
-        void runPromise.then(() => { finished = true; });
+            let finished = false;
+            // Mock the call to persist state.
+            setValueSpy.mockImplementationOnce(persistResolve as any);
+            // The crawler will pause after 200 requests
+            const runPromise = basicCrawler.run();
+            void runPromise.then(() => {
+                finished = true;
+            });
 
-        // need to monkeypatch the stats class, otherwise it will never finish
-        basicCrawler.stats.persistState = () => Promise.resolve();
-        await persistPromise;
+            // need to monkeypatch the stats class, otherwise it will never finish
+            basicCrawler.stats.persistState = async () => Promise.resolve();
+            await persistPromise;
 
-        expect(finished).toBe(false);
-        expect(await requestList.isFinished()).toBe(false);
-        expect(await requestList.isEmpty()).toBe(false);
-        expect(processed.length).toBe(200);
+            expect(finished).toBe(false);
+            expect(await requestList.isFinished()).toBe(false);
+            expect(await requestList.isEmpty()).toBe(false);
+            expect(processed.length).toBe(200);
 
-        expect(getValueSpy).toBeCalled();
-        expect(setValueSpy).toBeCalled();
+            expect(getValueSpy).toBeCalled();
+            expect(setValueSpy).toBeCalled();
 
-        // clean up
-        // @ts-expect-error Accessing private method
-        await basicCrawler.autoscaledPool._destroy();
-        getValueSpy.mockRestore();
-        setValueSpy.mockRestore();
-    });
+            // clean up
+            // @ts-expect-error Accessing private method
+            await basicCrawler.autoscaledPool!._destroy();
+        },
+    );
 
     test('should retry failed requests', async () => {
         const sources = [
@@ -285,6 +313,41 @@ describe('BasicCrawler', () => {
         expect(processed['http://example.com/2'].userData.foo).toBeUndefined();
         expect(processed['http://example.com/2'].errorMessages).toHaveLength(11);
         expect(processed['http://example.com/2'].retryCount).toBe(10);
+
+        expect(await requestList.isFinished()).toBe(true);
+        expect(await requestList.isEmpty()).toBe(true);
+    });
+
+    test('should retry failed requests based on `request.maxRetries`', async () => {
+        const sources = [
+            { url: 'http://example.com/1', maxRetries: 10 },
+            { url: 'http://example.com/2', maxRetries: 5 },
+            { url: 'http://example.com/3', maxRetries: 1 },
+        ];
+        const processed: Dictionary<Request> = {};
+        const requestList = await RequestList.open(null, sources);
+
+        const requestHandler: RequestHandler = async ({ request }) => {
+            await sleep(10);
+            processed[request.url] = request;
+            throw Error(`This is ${request.retryCount}th error!`);
+        };
+
+        const basicCrawler = new BasicCrawler({
+            requestList,
+            minConcurrency: 3,
+            maxConcurrency: 3,
+            requestHandler,
+        });
+
+        await basicCrawler.run();
+
+        expect(processed['http://example.com/1'].errorMessages).toHaveLength(11);
+        expect(processed['http://example.com/1'].retryCount).toBe(10);
+        expect(processed['http://example.com/2'].errorMessages).toHaveLength(6);
+        expect(processed['http://example.com/2'].retryCount).toBe(5);
+        expect(processed['http://example.com/3'].errorMessages).toHaveLength(2);
+        expect(processed['http://example.com/3'].retryCount).toBe(1);
 
         expect(await requestList.isFinished()).toBe(true);
         expect(await requestList.isEmpty()).toBe(true);
@@ -343,9 +406,7 @@ describe('BasicCrawler', () => {
     });
 
     test('should correctly track request.state', async () => {
-        const sources = [
-            { url: 'http://example.com/1' },
-        ];
+        const sources = [{ url: 'http://example.com/1' }];
         const requestList = await RequestList.open(null, sources);
         const requestStates: RequestState[] = [];
 
@@ -368,7 +429,11 @@ describe('BasicCrawler', () => {
 
         await basicCrawler.run();
 
-        expect(requestStates).toEqual([RequestState.REQUEST_HANDLER, RequestState.ERROR_HANDLER, RequestState.REQUEST_HANDLER]);
+        expect(requestStates).toEqual([
+            RequestState.REQUEST_HANDLER,
+            RequestState.ERROR_HANDLER,
+            RequestState.REQUEST_HANDLER,
+        ]);
     });
 
     test('should use errorHandler', async () => {
@@ -514,7 +579,7 @@ describe('BasicCrawler', () => {
 
         await crawler.run();
 
-        expect(request.retryCount).toBe(0);
+        expect(request!.retryCount).toBe(0);
     });
 
     test('should crash on CriticalError', async () => {
@@ -529,7 +594,7 @@ describe('BasicCrawler', () => {
             throw new CriticalError('some-error');
         };
 
-        const failedRequestHandler = jest.fn() as ErrorHandler;
+        const failedRequestHandler = vitest.fn() as ErrorHandler;
 
         const basicCrawler = new BasicCrawler({
             requestList,
@@ -551,13 +616,13 @@ describe('BasicCrawler', () => {
         ];
         const requestList = await RequestList.open(null, sources);
 
-        const failedRequestHandler = jest.fn() as ErrorHandler;
+        const failedRequestHandler = vitest.fn() as ErrorHandler;
 
         const basicCrawler = new BasicCrawler({
             requestList,
             failedRequestHandler,
         });
-        const testRoute = jest.fn();
+        const testRoute = vitest.fn();
         basicCrawler.router.addHandler('TEST', testRoute);
 
         await expect(basicCrawler.run()).rejects.toThrow(MissingRouteError);
@@ -597,9 +662,10 @@ describe('BasicCrawler', () => {
             requestHandler,
         });
 
-        jest.spyOn(requestQueue, 'handledCount').mockResolvedValueOnce(0);
+        vitest.spyOn(requestQueue, 'handledCount').mockResolvedValueOnce(0);
 
-        jest.spyOn(requestQueue, 'addRequest')
+        vitest
+            .spyOn(requestQueue, 'addRequest')
             .mockResolvedValueOnce({ requestId: 'id-0' } as any)
             .mockResolvedValueOnce({ requestId: 'id-1' } as any)
             .mockResolvedValueOnce({ requestId: 'id-2' } as any);
@@ -608,7 +674,8 @@ describe('BasicCrawler', () => {
         const request1 = new Request({ id: 'id-1', ...sources[1] });
         const request2 = new Request({ id: 'id-2', ...sources[2] });
 
-        jest.spyOn(requestQueue, 'fetchNextRequest')
+        vitest
+            .spyOn(requestQueue, 'fetchNextRequest')
             .mockResolvedValueOnce(request0)
             .mockResolvedValueOnce(request1)
             .mockResolvedValueOnce(request2)
@@ -616,23 +683,25 @@ describe('BasicCrawler', () => {
             .mockResolvedValueOnce(request1)
             .mockResolvedValueOnce(request1);
 
-        const markReqHandled = jest.spyOn(requestQueue, 'markRequestHandled').mockReturnValue(Promise.resolve() as any);
-        const reclaimReq = jest.spyOn(requestQueue, 'reclaimRequest').mockReturnValue(Promise.resolve() as any);
+        const markReqHandled = vitest
+            .spyOn(requestQueue, 'markRequestHandled')
+            .mockReturnValue(Promise.resolve() as any);
+        const reclaimReq = vitest.spyOn(requestQueue, 'reclaimRequest').mockReturnValue(Promise.resolve() as any);
 
-        jest.spyOn(requestQueue, 'isEmpty')
+        vitest
+            .spyOn(requestQueue, 'isEmpty')
             .mockResolvedValueOnce(false)
             .mockResolvedValueOnce(false)
             .mockResolvedValueOnce(false)
             .mockResolvedValueOnce(true);
 
-        jest.spyOn(requestQueue, 'isFinished')
-            .mockResolvedValueOnce(true);
+        vitest.spyOn(requestQueue, 'isFinished').mockResolvedValueOnce(true);
 
         await basicCrawler.run();
 
         // 1st try
 
-        expect(reclaimReq).toBeCalledWith(request1);
+        expect(reclaimReq).toBeCalledWith(request1, expect.objectContaining({}));
         expect(reclaimReq).toBeCalledTimes(3);
 
         expect(processed['http://example.com/0'].userData.foo).toBe('bar');
@@ -649,12 +718,12 @@ describe('BasicCrawler', () => {
         expect(await requestList.isFinished()).toBe(true);
         expect(await requestList.isEmpty()).toBe(true);
 
-        jest.restoreAllMocks();
+        vitest.restoreAllMocks();
     });
 
     test('should say that task is not ready requestList is not set and requestQueue is empty', async () => {
         const requestQueue = new RequestQueue({ id: 'xxx', client: Configuration.getStorageClient() });
-        requestQueue.isEmpty = () => Promise.resolve(true);
+        requestQueue.isEmpty = async () => Promise.resolve(true);
 
         const crawler = new BasicCrawler({
             requestQueue,
@@ -676,7 +745,7 @@ describe('BasicCrawler', () => {
             autoscaledPoolOptions: {
                 minConcurrency: 1,
                 maxConcurrency: 1,
-                isFinishedFunction: () => {
+                isFinishedFunction: async () => {
                     return Promise.resolve(isFinished);
                 },
             },
@@ -693,18 +762,21 @@ describe('BasicCrawler', () => {
         const request0 = new Request({ url: 'http://example.com/0' });
         const request1 = new Request({ url: 'http://example.com/1' });
 
-        jest.spyOn(requestQueue, 'handledCount').mockReturnValue(Promise.resolve() as any);
-        const markRequestHandled = jest.spyOn(requestQueue, 'markRequestHandled')
+        vitest.spyOn(requestQueue, 'handledCount').mockReturnValue(Promise.resolve() as any);
+        const markRequestHandled = vitest
+            .spyOn(requestQueue, 'markRequestHandled')
             .mockReturnValue(Promise.resolve() as any);
 
-        const isFinishedOrig = jest.spyOn(requestQueue, 'isFinished').mockImplementation();
+        const isFinishedOrig = vitest.spyOn(requestQueue, 'isFinished');
 
-        requestQueue.fetchNextRequest = () => Promise.resolve(queue.pop());
-        requestQueue.isEmpty = () => Promise.resolve(!queue.length);
+        requestQueue.fetchNextRequest = async () => queue.pop()!;
+        requestQueue.isEmpty = async () => Promise.resolve(!queue.length);
 
         setTimeout(() => queue.push(request0), 10);
         setTimeout(() => queue.push(request1), 100);
-        setTimeout(() => { isFinished = true; }, 150);
+        setTimeout(() => {
+            isFinished = true;
+        }, 150);
 
         await basicCrawler.run();
 
@@ -715,7 +787,7 @@ describe('BasicCrawler', () => {
         // TODO: see why the request1 was passed as a second parameter to includes
         expect(processed.includes(request0)).toBe(true);
 
-        jest.restoreAllMocks();
+        vitest.restoreAllMocks();
     });
 
     test('keepAlive', async () => {
@@ -739,18 +811,21 @@ describe('BasicCrawler', () => {
         const request0 = new Request({ url: 'http://example.com/0' });
         const request1 = new Request({ url: 'http://example.com/1' });
 
-        jest.spyOn(requestQueue, 'handledCount').mockReturnValue(Promise.resolve() as any);
-        const markRequestHandled = jest.spyOn(requestQueue, 'markRequestHandled')
+        vitest.spyOn(requestQueue, 'handledCount').mockReturnValue(Promise.resolve() as any);
+        const markRequestHandled = vitest
+            .spyOn(requestQueue, 'markRequestHandled')
             .mockReturnValue(Promise.resolve() as any);
 
-        const isFinishedOrig = jest.spyOn(requestQueue, 'isFinished').mockImplementation();
+        const isFinishedOrig = vitest.spyOn(requestQueue, 'isFinished');
 
-        requestQueue.fetchNextRequest = () => Promise.resolve(queue.pop());
-        requestQueue.isEmpty = () => Promise.resolve(!queue.length);
+        requestQueue.fetchNextRequest = async () => Promise.resolve(queue.pop()!);
+        requestQueue.isEmpty = async () => Promise.resolve(!queue.length);
 
         setTimeout(() => queue.push(request0), 10);
         setTimeout(() => queue.push(request1), 100);
-        setTimeout(() => { void basicCrawler.teardown(); }, 300);
+        setTimeout(() => {
+            void basicCrawler.teardown();
+        }, 300);
 
         await basicCrawler.run();
 
@@ -761,7 +836,7 @@ describe('BasicCrawler', () => {
         // TODO: see why the request1 was passed as a second parameter to includes
         expect(processed.includes(request0)).toBe(true);
 
-        jest.restoreAllMocks();
+        vitest.restoreAllMocks();
     });
 
     test('should support maxRequestsPerCrawl parameter', async () => {
@@ -820,11 +895,11 @@ describe('BasicCrawler', () => {
         requestQueue.isEmpty = async () => false;
         requestQueue.isFinished = async () => false;
 
-        requestQueue.fetchNextRequest = async () => (new Request({ id: 'id', url: 'http://example.com' }));
+        requestQueue.fetchNextRequest = async () => new Request({ id: 'id', url: 'http://example.com' });
         // @ts-expect-error Overriding the method for testing purposes
         requestQueue.markRequestHandled = async () => {};
 
-        const requestQueueStub = jest.spyOn(requestQueue, 'handledCount').mockResolvedValue(33);
+        const requestQueueStub = vitest.spyOn(requestQueue, 'handledCount').mockResolvedValue(33);
 
         let count = 0;
         let crawler = new BasicCrawler({
@@ -840,12 +915,12 @@ describe('BasicCrawler', () => {
         await crawler.run();
         expect(requestQueueStub).toBeCalled();
         expect(count).toBe(7);
-        jest.restoreAllMocks();
+        vitest.restoreAllMocks();
 
         const sources = Array.from(Array(10).keys(), (x) => x + 1).map((i) => ({ url: `http://example.com/${i}` }));
         const sourcesCopy = JSON.parse(JSON.stringify(sources));
         let requestList = await RequestList.open({ sources });
-        const requestListStub = jest.spyOn(requestList, 'handledCount').mockReturnValue(33);
+        const requestListStub = vitest.spyOn(requestList, 'handledCount').mockReturnValue(33);
 
         count = 0;
         crawler = new BasicCrawler({
@@ -861,12 +936,12 @@ describe('BasicCrawler', () => {
         await crawler.run();
         expect(requestListStub).toBeCalled();
         expect(count).toBe(7);
-        jest.restoreAllMocks();
+        vitest.restoreAllMocks();
 
         requestList = await RequestList.open({ sources: sourcesCopy });
-        const listStub = jest.spyOn(requestList, 'handledCount').mockReturnValue(20);
-        const queueStub = jest.spyOn(requestQueue, 'handledCount').mockResolvedValue(33);
-        const addRequestStub = jest.spyOn(requestQueue, 'addRequest').mockReturnValue(Promise.resolve() as any);
+        const listStub = vitest.spyOn(requestList, 'handledCount').mockReturnValue(20);
+        const queueStub = vitest.spyOn(requestQueue, 'handledCount').mockResolvedValue(33);
+        const addRequestStub = vitest.spyOn(requestQueue, 'addRequest').mockReturnValue(Promise.resolve() as any);
 
         count = 0;
         crawler = new BasicCrawler({
@@ -887,7 +962,7 @@ describe('BasicCrawler', () => {
         expect(addRequestStub).toBeCalledTimes(7);
         expect(count).toBe(7);
 
-        jest.restoreAllMocks();
+        vitest.restoreAllMocks();
     });
 
     test('should timeout after handleRequestTimeoutSecs', async () => {
@@ -899,7 +974,7 @@ describe('BasicCrawler', () => {
             requestList,
             handleRequestTimeoutSecs: 0.01,
             maxRequestRetries: 1,
-            requestHandler: () => sleep(1000),
+            requestHandler: async () => sleep(1000),
             failedRequestHandler: async ({ request }) => {
                 results.push(request);
             },
@@ -911,7 +986,7 @@ describe('BasicCrawler', () => {
         results[0].errorMessages.forEach((msg) => expect(msg).toMatch('requestHandler timed out'));
     });
 
-    test('limits handleRequestTimeoutSecs to a valid value', async () => {
+    test('limits handleRequestTimeoutSecs and derived vars to a valid value', async () => {
         const url = 'https://example.com';
         const requestList = await RequestList.open({ sources: [{ url }] });
 
@@ -920,7 +995,7 @@ describe('BasicCrawler', () => {
             requestList,
             requestHandlerTimeoutSecs: Infinity,
             maxRequestRetries: 1,
-            requestHandler: () => sleep(1000),
+            requestHandler: async () => sleep(1000),
             failedRequestHandler: async ({ request }) => {
                 results.push(request);
             },
@@ -929,6 +1004,8 @@ describe('BasicCrawler', () => {
         const maxSignedInteger = 2 ** 31 - 1;
         // @ts-expect-error Accessing private prop
         expect(crawler.requestHandlerTimeoutMillis).toBe(maxSignedInteger);
+        // @ts-expect-error Accessing private prop
+        expect(crawler.internalTimeoutMillis).toBe(maxSignedInteger);
     });
 
     test('should not log stack trace for timeout errors by default', async () => {
@@ -939,13 +1016,11 @@ describe('BasicCrawler', () => {
             requestList,
             requestHandlerTimeoutSecs: 0.1,
             maxRequestRetries: 3,
-            requestHandler: () => sleep(1e3),
+            requestHandler: async () => sleep(1e3),
         });
 
-        // @ts-expect-error Overriding protected method
-        const warningSpy = jest.spyOn(crawler.log, 'warning');
-        // @ts-expect-error Overriding protected method
-        const errorSpy = jest.spyOn(crawler.log, 'error');
+        const warningSpy = vitest.spyOn(crawler.log, 'warning');
+        const errorSpy = vitest.spyOn(crawler.log, 'error');
 
         await crawler.run();
 
@@ -982,10 +1057,8 @@ describe('BasicCrawler', () => {
             },
         });
 
-        // @ts-expect-error Overriding protected method
-        const warningSpy = jest.spyOn(crawler.log, 'warning');
-        // @ts-expect-error Overriding protected method
-        const errorSpy = jest.spyOn(crawler.log, 'error');
+        const warningSpy = vitest.spyOn(crawler.log, 'warning');
+        const errorSpy = vitest.spyOn(crawler.log, 'error');
 
         await crawler.run();
 
@@ -1005,7 +1078,7 @@ describe('BasicCrawler', () => {
             expect(typeof args[0]).toBe('string');
             expect(/Request failed and reached maximum retries/.test(args[0])).toBe(true);
             expect(/Other non-timeout error/.test(args[0])).toBe(true);
-            expect(/at BasicCrawler\.requestHandler/.test(args[0])).toBe(true);
+            expect(/at _?BasicCrawler\.requestHandler/.test(args[0])).toBe(true);
             expect(args[1]).toBeDefined();
         }
     });
@@ -1020,13 +1093,11 @@ describe('BasicCrawler', () => {
             requestList,
             requestHandlerTimeoutSecs: 0.1,
             maxRequestRetries: 3,
-            requestHandler: () => sleep(1e3),
+            requestHandler: async () => sleep(1e3),
         });
 
-        // @ts-expect-error Overriding protected method
-        const warningSpy = jest.spyOn(crawler.log, 'warning');
-        // @ts-expect-error Overriding protected method
-        const errorSpy = jest.spyOn(crawler.log, 'error');
+        const warningSpy = vitest.spyOn(crawler.log, 'warning');
+        const errorSpy = vitest.spyOn(crawler.log, 'error');
 
         await crawler.run();
 
@@ -1068,10 +1139,8 @@ describe('BasicCrawler', () => {
             },
         });
 
-        // @ts-expect-error Overriding protected method
-        const warningSpy = jest.spyOn(crawler.log, 'warning');
-        // @ts-expect-error Overriding protected method
-        const errorSpy = jest.spyOn(crawler.log, 'error');
+        const warningSpy = vitest.spyOn(crawler.log, 'warning');
+        const errorSpy = vitest.spyOn(crawler.log, 'error');
 
         await crawler.run();
 
@@ -1081,7 +1150,7 @@ describe('BasicCrawler', () => {
             expect(typeof args[0]).toBe('string');
             expect(/Reclaiming failed request back to the list or queue/.test(args[0])).toBe(true);
             expect(/Other non-timeout error/.test(args[0])).toBe(true);
-            expect(/at BasicCrawler\.requestHandler/.test(args[0])).toBe(true);
+            expect(/at _?BasicCrawler\.requestHandler/.test(args[0])).toBe(true);
             expect(args[1]).toBeDefined();
         }
 
@@ -1091,7 +1160,7 @@ describe('BasicCrawler', () => {
             expect(typeof args[0]).toBe('string');
             expect(/Request failed and reached maximum retries/.test(args[0])).toBe(true);
             expect(/Other non-timeout error/.test(args[0])).toBe(true);
-            expect(/at BasicCrawler\.requestHandler/.test(args[0])).toBe(true);
+            expect(/at _?BasicCrawler\.requestHandler/.test(args[0])).toBe(true);
             expect(args[1]).toBeDefined();
         }
 
@@ -1115,8 +1184,8 @@ describe('BasicCrawler', () => {
                     persistStateKey: 'POOL',
                 },
                 requestHandler: async ({ session }) => {
-                    expect(session.constructor.name).toEqual('Session');
-                    expect(session.id).toBeDefined();
+                    expect(session!.constructor.name).toEqual('Session');
+                    expect(session!.id).toBeDefined();
                 },
                 failedRequestHandler: async ({ request }) => {
                     results.push(request);
@@ -1236,16 +1305,18 @@ describe('BasicCrawler', () => {
 
         let url: string;
 
-        beforeAll((callback) => {
-            httpServer.listen(0, () => {
-                url = `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}/`;
+        beforeAll(async () => {
+            await new Promise<void>((resolve) => {
+                httpServer.listen(0, () => {
+                    url = `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}/`;
 
-                callback();
+                    resolve();
+                });
             });
         });
 
-        afterAll((callback) => {
-            httpServer.close(callback);
+        afterAll(async () => {
+            await new Promise((resolve) => httpServer.close(resolve));
         });
 
         test('works', async () => {
@@ -1315,6 +1386,103 @@ describe('BasicCrawler', () => {
             });
 
             expect(crawler).toBeTruthy();
+        });
+    });
+
+    describe('Dataset helpers, crawler parallelism', () => {
+        const payload: Dictionary[] = [{ foo: 'bar', baz: 123 }];
+        const getPayload: (id: string) => Dictionary[] = (id) => [{ foo: id }];
+
+        const tmpDir: string = `${__dirname}/tmp/foo/bar`;
+
+        beforeAll(async () => {
+            await rm(tmpDir, { recursive: true, force: true });
+        });
+
+        test('should expose default Dataset methods', async () => {
+            const crawler = new BasicCrawler();
+
+            await crawler.pushData(payload);
+
+            expect((await crawler.getData()).items).toEqual(payload);
+        });
+
+        test('export data', async () => {
+            const row: Dictionary = { foo: 'bar', baz: 123 };
+            const crawler = new BasicCrawler();
+
+            await crawler.pushData(row);
+            await crawler.pushData(row);
+            await crawler.pushData(row);
+
+            await crawler.exportData(`${tmpDir}/result.csv`);
+            await crawler.exportData(`${tmpDir}/result.json`);
+
+            const csv = await readFile(`${tmpDir}/result.csv`);
+            expect(csv.toString()).toBe('foo,baz\nbar,123\nbar,123\nbar,123\n');
+            const json = await readFile(`${tmpDir}/result.json`);
+            expect(json.toString()).toBe(
+                '[\n' +
+                    '    {\n' +
+                    '        "foo": "bar",\n' +
+                    '        "baz": 123\n' +
+                    '    },\n' +
+                    '    {\n' +
+                    '        "foo": "bar",\n' +
+                    '        "baz": 123\n' +
+                    '    },\n' +
+                    '    {\n' +
+                    '        "foo": "bar",\n' +
+                    '        "baz": 123\n' +
+                    '    }\n' +
+                    ']\n',
+            );
+
+            await rm(`${tmpDir}/result.csv`);
+            await rm(`${tmpDir}/result.json`);
+        });
+
+        test('should expose pushData helper', async () => {
+            const crawler = new BasicCrawler({
+                requestHandler: async ({ pushData }) => pushData(payload),
+            });
+
+            await crawler.run([
+                {
+                    url: `http://${HOSTNAME}:${port}`,
+                },
+            ]);
+
+            expect((await crawler.getData()).items).toEqual(payload);
+        });
+
+        test("Crawlers with different Configurations don't share Datasets", async () => {
+            const crawlerA = new BasicCrawler({}, new Configuration({ persistStorage: false }));
+            const crawlerB = new BasicCrawler({}, new Configuration({ persistStorage: false }));
+
+            await crawlerA.pushData(getPayload('A'));
+            await crawlerB.pushData(getPayload('B'));
+
+            expect((await crawlerA.getData()).items).toEqual(getPayload('A'));
+
+            expect((await crawlerB.getData()).items).toEqual(getPayload('B'));
+        });
+
+        test('Crawlers with different Configurations run separately', async () => {
+            const crawlerA = new BasicCrawler(
+                { requestHandler: () => {} },
+                new Configuration({ persistStorage: false }),
+            );
+            const crawlerB = new BasicCrawler(
+                { requestHandler: () => {} },
+                new Configuration({ persistStorage: false }),
+            );
+
+            await crawlerA.run([{ url: `http://${HOSTNAME}:${port}` }]);
+            await crawlerB.run([{ url: `http://${HOSTNAME}:${port}` }]);
+
+            expect(crawlerA.stats.state.requestsFinished).toBe(1);
+            expect(crawlerB.stats.state.requestsFinished).toBe(1);
         });
     });
 });

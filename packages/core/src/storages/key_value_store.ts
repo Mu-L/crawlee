@@ -1,15 +1,18 @@
-import JSON5 from 'json5';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
 import { KEY_VALUE_STORE_KEY_REGEX } from '@apify/consts';
 import { jsonStringifyExtended } from '@apify/utilities';
-import ow, { ArgumentError } from 'ow';
 import type { Dictionary, KeyValueStoreClient, StorageClient } from '@crawlee/types';
-import { join } from 'node:path';
-import { readFile } from 'node:fs/promises';
-import { Configuration } from '../configuration';
-import type { Awaitable } from '../typedefs';
+import JSON5 from 'json5';
+import ow, { ArgumentError } from 'ow';
+
+import { checkStorageAccess } from './access_checking';
 import type { StorageManagerOptions } from './storage_manager';
 import { StorageManager } from './storage_manager';
 import { purgeDefaultStorages } from './utils';
+import { Configuration } from '../configuration';
+import type { Awaitable } from '../typedefs';
 
 /**
  * Helper function to possibly stringify value if options.contentType is not set.
@@ -34,8 +37,10 @@ export const maybeStringify = <T>(value: T, options: { contentType?: string }) =
         }
 
         if (value === undefined) {
-            throw new Error('The "value" parameter was stringified to JSON and returned undefined. '
-                + 'Make sure you\'re not trying to stringify an undefined value.');
+            throw new Error(
+                'The "value" parameter was stringified to JSON and returned undefined. ' +
+                    "Make sure you're not trying to stringify an undefined value.",
+            );
         }
     }
 
@@ -110,7 +115,10 @@ export class KeyValueStore {
     /**
      * @internal
      */
-    constructor(options: KeyValueStoreOptions, readonly config = Configuration.getGlobalConfig()) {
+    constructor(
+        options: KeyValueStoreOptions,
+        readonly config = Configuration.getGlobalConfig(),
+    ) {
         this.id = options.id;
         this.name = options.name;
         this.client = options.client.keyValueStore(this.id);
@@ -146,7 +154,7 @@ export class KeyValueStore {
      *   or [`Buffer`](https://nodejs.org/api/buffer.html), depending
      *   on the MIME content type of the record.
      */
-    async getValue<T = unknown>(key: string): Promise<T | null>
+    async getValue<T = unknown>(key: string): Promise<T | null>;
     /**
      * Gets a value from the key-value store.
      *
@@ -179,7 +187,7 @@ export class KeyValueStore {
      *   or [`Buffer`](https://nodejs.org/api/buffer.html), depending
      *   on the MIME content type of the record, or the default value if the key is missing from the store.
      */
-    async getValue<T = unknown>(key: string, defaultValue: T): Promise<T>
+    async getValue<T = unknown>(key: string, defaultValue: T): Promise<T>;
     /**
      * Gets a value from the key-value store.
      *
@@ -213,18 +221,44 @@ export class KeyValueStore {
      *   on the MIME content type of the record, or `null` if the key is missing from the store.
      */
     async getValue<T = unknown>(key: string, defaultValue?: T): Promise<T | null> {
+        checkStorageAccess();
+
         ow(key, ow.string.nonEmpty);
         const record = await this.client.getRecord(key);
 
-        return record?.value as T ?? defaultValue ?? null;
+        return (record?.value as T) ?? defaultValue ?? null;
+    }
+
+    /**
+     * Tests whether a record with the given key exists in the key-value store without retrieving its value.
+     *
+     * @param key The queried record key.
+     * @returns `true` if the record exists, `false` if it does not.
+     */
+    async recordExists(key: string): Promise<boolean> {
+        checkStorageAccess();
+
+        ow(key, ow.string.nonEmpty);
+        return this.client.recordExists(key);
     }
 
     async getAutoSavedValue<T extends Dictionary = Dictionary>(key: string, defaultValue = {} as T): Promise<T> {
+        checkStorageAccess();
+
         if (this.cache.has(key)) {
             return this.cache.get(key) as T;
         }
 
         const value = await this.getValue<T>(key, defaultValue);
+
+        // The await above could have run in parallel with another call to this function. If the other call finished more quickly,
+        // the value will in cache at this point, and returning the new fetched value would introduce two different instances of
+        // the auto-saved object, and only the latter one would be persisted.
+        // Therefore we re-check the cache here, and if such race condition happened, we drop the fetched value and return the cached one.
+        if (this.cache.has(key)) {
+            return this.cache.get(key) as T;
+        }
+
         this.cache.set(key, value!);
         this.ensurePersistStateEvent();
 
@@ -289,18 +323,34 @@ export class KeyValueStore {
      * @param [options] Record options.
      */
     async setValue<T>(key: string, value: T | null, options: RecordOptions = {}): Promise<void> {
+        checkStorageAccess();
+
         ow(key, 'key', ow.string.nonEmpty);
-        ow(key, ow.string.validate((k) => ({
-            validator: ow.isValid(k, ow.string.matches(KEY_VALUE_STORE_KEY_REGEX)),
-            message: 'The "key" argument must be at most 256 characters long and only contain the following characters: a-zA-Z0-9!-_.\'()',
-        })));
-        if (options.contentType
-           && !(ow.isValid(value, ow.any(ow.string, ow.buffer)) || (ow.isValid(value, ow.object) && typeof (value as Dictionary).pipe === 'function'))) {
-            throw new ArgumentError('The "value" parameter must be a String, Buffer or Stream when "options.contentType" is specified.', this.setValue);
+        ow(
+            key,
+            ow.string.validate((k) => ({
+                validator: ow.isValid(k, ow.string.matches(KEY_VALUE_STORE_KEY_REGEX)),
+                message: `The "key" argument "${key}" must be at most 256 characters long and only contain the following characters: a-zA-Z0-9!-_.'()`,
+            })),
+        );
+        if (
+            options.contentType &&
+            !(
+                ow.isValid(value, ow.any(ow.string, ow.uint8Array)) ||
+                (ow.isValid(value, ow.object) && typeof (value as Dictionary).pipe === 'function')
+            )
+        ) {
+            throw new ArgumentError(
+                'The "value" parameter must be a String, Buffer or Stream when "options.contentType" is specified.',
+                this.setValue,
+            );
         }
-        ow(options, ow.object.exactShape({
-            contentType: ow.optional.string.nonEmpty,
-        }));
+        ow(
+            options,
+            ow.object.exactShape({
+                contentType: ow.optional.string.nonEmpty,
+            }),
+        );
 
         // Make copy of options, don't update what user passed.
         const optionsCopy = { ...options };
@@ -315,7 +365,7 @@ export class KeyValueStore {
             } else if (typeof value === 'object') {
                 // We need to remove the keys that are no longer present in the new value.
                 Object.keys(cachedValue)
-                    .filter((k) => !(k in value!))
+                    .filter((k) => !(k in (value as Dictionary)))
                     .forEach((k) => this.cache.delete(k));
                 // And update the existing ones + add new ones.
                 Object.assign(cachedValue, value);
@@ -339,6 +389,8 @@ export class KeyValueStore {
      * depending on the mode of operation.
      */
     async drop(): Promise<void> {
+        checkStorageAccess();
+
         await this.client.delete();
         const manager = StorageManager.getManager(KeyValueStore, this.config);
         manager.closeStorage(this);
@@ -346,6 +398,8 @@ export class KeyValueStore {
 
     /** @internal */
     clearCache(): void {
+        checkStorageAccess();
+
         this.cache.clear();
     }
 
@@ -371,15 +425,24 @@ export class KeyValueStore {
      * @param [options] All `forEachKey()` parameters.
      */
     async forEachKey(iteratee: KeyConsumer, options: KeyValueStoreIteratorOptions = {}): Promise<void> {
+        checkStorageAccess();
+
         return this._forEachKey(iteratee, options);
     }
 
-    private async _forEachKey(iteratee: KeyConsumer, options: KeyValueStoreIteratorOptions = {}, index = 0): Promise<void> {
+    private async _forEachKey(
+        iteratee: KeyConsumer,
+        options: KeyValueStoreIteratorOptions = {},
+        index = 0,
+    ): Promise<void> {
         const { exclusiveStartKey } = options;
         ow(iteratee, ow.function);
-        ow(options, ow.object.exactShape({
-            exclusiveStartKey: ow.optional.string,
-        }));
+        ow(
+            options,
+            ow.object.exactShape({
+                exclusiveStartKey: ow.optional.string,
+            }),
+        );
 
         const response = await this.client.listKeys({ exclusiveStartKey });
         const { nextExclusiveStartKey, isTruncated, items } = response;
@@ -389,6 +452,14 @@ export class KeyValueStore {
         return isTruncated
             ? this._forEachKey(iteratee, { exclusiveStartKey: nextExclusiveStartKey }, index)
             : undefined; // [].forEach() returns undefined.
+    }
+
+    /**
+     * Returns a file URL for the given key.
+     */
+    getPublicUrl(key: string): string {
+        const name = this.name ?? this.config.get('defaultKeyValueStoreId');
+        return `file://${process.cwd()}/storage/key_value_stores/${name}/${key}`;
     }
 
     /**
@@ -406,14 +477,25 @@ export class KeyValueStore {
      * @param [options] Storage manager options.
      */
     static async open(storeIdOrName?: string | null, options: StorageManagerOptions = {}): Promise<KeyValueStore> {
+        checkStorageAccess();
+
         ow(storeIdOrName, ow.optional.any(ow.string, ow.null));
-        ow(options, ow.object.exactShape({
-            config: ow.optional.object.instanceOf(Configuration),
-        }));
-        await purgeDefaultStorages();
+        ow(
+            options,
+            ow.object.exactShape({
+                config: ow.optional.object.instanceOf(Configuration),
+                storageClient: ow.optional.object,
+            }),
+        );
+
+        options.config ??= Configuration.getGlobalConfig();
+        options.storageClient ??= options.config.getStorageClient();
+
+        await purgeDefaultStorages({ onlyPurgeOnce: true, client: options.storageClient, config: options.config });
+
         const manager = StorageManager.getManager(this, options.config);
 
-        return manager.openStorage(storeIdOrName);
+        return manager.openStorage(storeIdOrName, options.storageClient);
     }
 
     /**
@@ -444,7 +526,7 @@ export class KeyValueStore {
      *   if the record is missing.
      * @ignore
      */
-    static async getValue<T = unknown>(key: string): Promise<T | null>
+    static async getValue<T = unknown>(key: string): Promise<T | null>;
     /**
      * Gets a value from the default {@apilink KeyValueStore} associated with the current crawler run.
      *
@@ -473,7 +555,7 @@ export class KeyValueStore {
      *   on the MIME content type of the record, or the provided default value.
      * @ignore
      */
-    static async getValue<T = unknown>(key: string, defaultValue: T): Promise<T>
+    static async getValue<T = unknown>(key: string, defaultValue: T): Promise<T>;
     /**
      * Gets a value from the default {@apilink KeyValueStore} associated with the current crawler run.
      *
@@ -506,6 +588,16 @@ export class KeyValueStore {
     static async getValue<T = unknown>(key: string, defaultValue?: T): Promise<T | null> {
         const store = await this.open();
         return store.getValue<T>(key, defaultValue as T);
+    }
+
+    /**
+     * Tests whether a record with the given key exists in the default {@apilink KeyValueStore} associated with the current crawler run.
+     * @param key The queried record key.
+     * @returns `true` if the record exists, `false` if it does not.
+     */
+    static async recordExists(key: string): Promise<boolean> {
+        const store = await this.open();
+        return store.recordExists(key);
     }
 
     static async getAutoSavedValue<T extends Dictionary = Dictionary>(key: string, defaultValue = {} as T): Promise<T> {

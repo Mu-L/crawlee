@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
-import type { BrowserContext, BrowserType, Browser } from 'playwright';
+
+import type { BrowserContext, BrowserType } from 'playwright';
 
 export interface BrowserOptions {
     browserContext: BrowserContext;
@@ -9,7 +10,7 @@ export interface BrowserOptions {
 /**
  * Browser wrapper created to have consistent API with persistent and non-persistent contexts.
  */
-export class PlaywrightBrowser extends EventEmitter implements Browser {
+export class PlaywrightBrowser extends EventEmitter {
     private _browserContext: BrowserContext;
     private _version: string;
     private _isConnected = true;
@@ -27,6 +28,10 @@ export class PlaywrightBrowser extends EventEmitter implements Browser {
             this._isConnected = false;
             this.emit('disconnected');
         });
+    }
+
+    async [Symbol.asyncDispose](): Promise<void> {
+        await this.close();
     }
 
     async close(): Promise<void> {

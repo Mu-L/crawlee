@@ -6,7 +6,5 @@
 		"allowJs": true,
 		"checkJs": true
 	},
-	"include": [
-		"./**/*.mjs"
-	]
+	"include": ["./**/*.mjs", "./**/*.ts"]
 }

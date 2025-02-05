@@ -1,9 +1,9 @@
-import { Actor } from 'apify';
 import { JSDOMCrawler, Dataset } from '@crawlee/jsdom';
-import { ApifyStorageLocal } from '@apify/storage-local';
+import { Actor } from 'apify';
 
 if (process.env.STORAGE_IMPLEMENTATION === 'LOCAL') {
-    await Actor.init({ storage: new ApifyStorageLocal() });
+    // @ts-ignore
+    await Actor.init({ storage: new (await import('@apify/storage-local')).ApifyStorageLocal() });
 } else {
     await Actor.init();
 }
@@ -24,8 +24,6 @@ const crawler = new JSDOMCrawler({
     },
 });
 
-await crawler.run([
-    'https://ahfarmer.github.io/calculator/',
-]);
+await crawler.run(['https://ahfarmer.github.io/calculator/']);
 
 await Actor.exit({ exit: Actor.isAtHome() });

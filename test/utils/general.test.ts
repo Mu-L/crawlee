@@ -1,50 +1,55 @@
-import { isDocker, weightedAvg, sleep, snakeCaseToCamelCase } from '@crawlee/utils';
-import type { IncomingMessage } from 'node:http';
 import asyncFs from 'node:fs/promises';
+import type { IncomingMessage } from 'node:http';
+
+import { isDocker, weightedAvg, sleep, snakeCaseToCamelCase } from '@crawlee/utils';
 
 describe('isDocker()', () => {
     test('works for dockerenv && cgroup', async () => {
-        const statMock = jest.spyOn(asyncFs, 'stat').mockImplementationOnce(() => Promise.resolve(null));
-        const readMock = jest.spyOn(asyncFs, 'readFile').mockImplementationOnce(() => Promise.resolve('something ... docker ... something'));
+        const statMock = vitest.spyOn(asyncFs, 'stat').mockImplementationOnce(async () => null as any);
+        const readMock = vitest
+            .spyOn(asyncFs, 'readFile')
+            .mockImplementationOnce(async () => Promise.resolve('something ... docker ... something'));
 
         const is = await isDocker(true);
 
         expect(is).toBe(true);
-        statMock.mockRestore();
-        readMock.mockRestore();
     });
 
     test('works for dockerenv', async () => {
-        const statMock = jest.spyOn(asyncFs, 'stat').mockImplementationOnce(() => Promise.resolve(null));
-        const readMock = jest.spyOn(asyncFs, 'readFile').mockImplementationOnce(() => Promise.resolve('something ... ... something'));
+        const statMock = vitest.spyOn(asyncFs, 'stat').mockImplementationOnce(async () => null as any);
+        const readMock = vitest
+            .spyOn(asyncFs, 'readFile')
+            .mockImplementationOnce(async () => Promise.resolve('something ... ... something'));
 
         const is = await isDocker(true);
 
         expect(is).toBe(true);
-        statMock.mockRestore();
-        readMock.mockRestore();
     });
 
     test('works for cgroup', async () => {
-        const statMock = jest.spyOn(asyncFs, 'stat').mockImplementationOnce(() => Promise.reject(new Error('no.')));
-        const readMock = jest.spyOn(asyncFs, 'readFile').mockImplementationOnce(() => Promise.resolve('something ... docker ... something'));
+        const statMock = vitest
+            .spyOn(asyncFs, 'stat')
+            .mockImplementationOnce(async () => Promise.reject(new Error('no.')));
+        const readMock = vitest
+            .spyOn(asyncFs, 'readFile')
+            .mockImplementationOnce(async () => Promise.resolve('something ... docker ... something'));
 
         const is = await isDocker(true);
 
         expect(is).toBe(true);
-        statMock.mockRestore();
-        readMock.mockRestore();
     });
 
     test('works for nothing', async () => {
-        const statMock = jest.spyOn(asyncFs, 'stat').mockImplementationOnce(() => Promise.reject(new Error('no.')));
-        const readMock = jest.spyOn(asyncFs, 'readFile').mockImplementationOnce(() => Promise.resolve('something ... ... something'));
+        const statMock = vitest
+            .spyOn(asyncFs, 'stat')
+            .mockImplementationOnce(async () => Promise.reject(new Error('no.')));
+        const readMock = vitest
+            .spyOn(asyncFs, 'readFile')
+            .mockImplementationOnce(async () => Promise.resolve('something ... ... something'));
 
         const is = await isDocker(true);
 
         expect(is).toBe(false);
-        statMock.mockRestore();
-        readMock.mockRestore();
     });
 });
 
@@ -53,7 +58,7 @@ describe('weightedAvg()', () => {
         expect(weightedAvg([10, 10, 10], [1, 1, 1])).toBe(10);
         expect(weightedAvg([5, 10, 15], [1, 1, 1])).toBe(10);
         expect(weightedAvg([10, 10, 10], [0.5, 1, 1.5])).toBe(10);
-        expect(weightedAvg([29, 35, 89], [13, 91, 3])).toEqual(((29 * 13) + (35 * 91) + (89 * 3)) / (13 + 91 + 3));
+        expect(weightedAvg([29, 35, 89], [13, 91, 3])).toEqual((29 * 13 + 35 * 91 + 89 * 3) / (13 + 91 + 3));
         expect(weightedAvg([], [])).toEqual(NaN);
         expect(weightedAvg([1], [0])).toEqual(NaN);
         expect(weightedAvg([], [1])).toEqual(NaN);
@@ -65,6 +70,7 @@ describe('sleep()', () => {
         await Promise.resolve();
         await sleep(0);
         await sleep();
+        // @ts-expect-error invalid input type
         await sleep(null);
         await sleep(-1);
 

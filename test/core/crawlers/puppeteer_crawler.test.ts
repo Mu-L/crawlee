@@ -1,26 +1,18 @@
-import log from '@apify/log';
-import type {
-    PuppeteerCrawlingContext,
-    PuppeteerGoToOptions,
-    Request,
-} from '@crawlee/puppeteer';
-import {
-    ProxyConfiguration,
-    PuppeteerCrawler,
-    RequestList,
-    RequestQueue,
-    Session,
-} from '@crawlee/puppeteer';
-import type { Cookie } from '@crawlee/types';
-import { sleep } from '@crawlee/utils';
 import { once } from 'events';
 import type { Server } from 'http';
 import { createServer } from 'http';
 import type { AddressInfo } from 'net';
 import os from 'os';
+import { promisify } from 'util';
+
+import log from '@apify/log';
+import type { PuppeteerCrawlingContext, PuppeteerGoToOptions, Request } from '@crawlee/puppeteer';
+import { ProxyConfiguration, PuppeteerCrawler, RequestList, RequestQueue, Session } from '@crawlee/puppeteer';
+import type { Cookie } from '@crawlee/types';
+import { sleep } from '@crawlee/utils';
 import type { Server as ProxyChainServer } from 'proxy-chain';
 import { MemoryStorageEmulator } from 'test/shared/MemoryStorageEmulator';
-import { promisify } from 'util';
+
 import { createProxyServer } from '../create-proxy-server';
 
 describe('PuppeteerCrawler', () => {
@@ -34,7 +26,7 @@ describe('PuppeteerCrawler', () => {
     let proxyConfiguration: ProxyConfiguration;
 
     beforeAll(async () => {
-        prevEnvHeadless = process.env.CRAWLEE_HEADLESS;
+        prevEnvHeadless = process.env.CRAWLEE_HEADLESS!;
         process.env.CRAWLEE_HEADLESS = '1';
         logLevel = log.getLevel();
         log.setLevel(log.LEVELS.ERROR);
@@ -55,7 +47,7 @@ describe('PuppeteerCrawler', () => {
             createProxyServer('127.0.0.4', '', ''),
         ];
 
-        await Promise.all(servers.map((server) => server.listen()));
+        await Promise.all(servers.map(async (server) => server.listen()));
 
         proxyConfiguration = new ProxyConfiguration({
             proxyUrls: [
@@ -81,7 +73,7 @@ describe('PuppeteerCrawler', () => {
         log.setLevel(logLevel);
         process.env.CRAWLEE_HEADLESS = prevEnvHeadless;
 
-        await Promise.all(servers.map((server) => promisify(server.close.bind(server))(true)));
+        await Promise.all(servers.map(async (server) => server.close(true)));
         await promisify(target.close.bind(target))();
     });
 
@@ -101,10 +93,15 @@ describe('PuppeteerCrawler', () => {
         const requestListLarge = await RequestList.open({ sources: sourcesLarge });
         const requestHandler = async ({ page, request, response }: PuppeteerCrawlingContext) => {
             await page.waitForSelector('title');
-            asserts.push(response.status() === 200);
+            asserts.push(response!.status() === 200);
             request.userData.title = await page.title();
             processed.push(request);
-            asserts.push(!response.request().headers()['user-agent'].match(/headless/i));
+            asserts.push(
+                !response!
+                    .request()
+                    .headers()
+                    ['user-agent'].match(/headless/i),
+            );
             asserts.push(!(await page.evaluate(() => window.navigator.webdriver)));
         };
 
@@ -121,7 +118,7 @@ describe('PuppeteerCrawler', () => {
 
         await puppeteerCrawler.run();
 
-        expect(puppeteerCrawler.autoscaledPool.minConcurrency).toBe(1);
+        expect(puppeteerCrawler.autoscaledPool!.minConcurrency).toBe(1);
         expect(processed).toHaveLength(6);
         expect(failed).toHaveLength(0);
 
@@ -143,19 +140,22 @@ describe('PuppeteerCrawler', () => {
             maxRequestRetries: 0,
             maxConcurrency: 1,
             requestHandler: () => {},
-            preNavigationHooks: [(_context, gotoOptions) => {
-                options = gotoOptions;
-            }],
+            preNavigationHooks: [
+                (_context, gotoOptions) => {
+                    options = gotoOptions;
+                },
+            ],
             navigationTimeoutSecs: timeoutSecs,
         });
 
         await puppeteerCrawler.run();
-        expect(options.timeout).toEqual(timeoutSecs * 1000);
+        expect(options!.timeout).toEqual(timeoutSecs * 1000);
     });
 
     test('should throw if launchOptions.proxyUrl is supplied', async () => {
         try {
-            new PuppeteerCrawler({ //eslint-disable-line
+            // eslint-disable-next-line
+            new PuppeteerCrawler({
                 requestList,
                 maxRequestRetries: 0,
                 maxConcurrency: 1,
@@ -165,7 +165,9 @@ describe('PuppeteerCrawler', () => {
                 requestHandler: () => {},
             });
         } catch (e) {
-            expect((e as Error).message).toMatch('PuppeteerCrawlerOptions.launchContext.proxyUrl is not allowed in PuppeteerCrawler.');
+            expect((e as Error).message).toMatch(
+                'PuppeteerCrawlerOptions.launchContext.proxyUrl is not allowed in PuppeteerCrawler.',
+            );
         }
 
         expect.hasAssertions();
@@ -219,7 +221,7 @@ describe('PuppeteerCrawler', () => {
     test('timeout via preNavigationHooks will abort the page function as early as possible (gh #1216)', async () => {
         const requestQueue = await RequestQueue.open();
         await requestQueue.addRequest({ url: serverUrl });
-        const requestHandler = jest.fn();
+        const requestHandler = vitest.fn();
 
         const crawler = new PuppeteerCrawler({
             requestQueue,
@@ -233,12 +235,10 @@ describe('PuppeteerCrawler', () => {
             requestHandler,
         });
 
-        // @ts-expect-error Overriding protected method
-        const logWarningSpy = jest.spyOn(crawler.log, 'warning');
+        const logWarningSpy = vitest.spyOn(crawler.log, 'warning');
         logWarningSpy.mockImplementation(() => {});
 
-        // @ts-expect-error Overriding protected method
-        const logErrorSpy = jest.spyOn(crawler.log, 'error');
+        const logErrorSpy = vitest.spyOn(crawler.log, 'error');
         logErrorSpy.mockImplementation(() => {});
 
         await crawler.run();
@@ -246,37 +246,23 @@ describe('PuppeteerCrawler', () => {
         await requestQueue.drop();
 
         expect(requestHandler).not.toBeCalled();
-        const warnings = logWarningSpy.mock.calls.map((call) => [call[0].split('\n')[0], call[1].retryCount]);
+        const warnings = logWarningSpy.mock.calls.map((call) => [call[0].split('\n')[0], call[1]!.retryCount]);
         expect(warnings).toEqual([
-            [
-                'Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.',
-                1,
-            ],
-            [
-                'Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.',
-                2,
-            ],
-            [
-                'Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.',
-                3,
-            ],
+            ['Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.', 1],
+            ['Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.', 2],
+            ['Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.', 3],
         ]);
-        logWarningSpy.mockRestore();
 
-        const errors = logErrorSpy.mock.calls.map((call) => [call[0], call[1].retryCount]);
+        const errors = logErrorSpy.mock.calls.map((call) => [call[0], call[1]!.retryCount]);
         expect(errors).toEqual([
-            [
-                'Request failed and reached maximum retries. Navigation timed out after 0.005 seconds.',
-                undefined,
-            ],
+            ['Request failed and reached maximum retries. Navigation timed out after 0.005 seconds.', undefined],
         ]);
-        logErrorSpy.mockRestore();
     });
 
     test('timeout in preLaunchHooks will abort the page function as early as possible (gh #1216)', async () => {
         const requestQueue = await RequestQueue.open();
         await requestQueue.addRequest({ url: serverUrl });
-        const requestHandler = jest.fn();
+        const requestHandler = vitest.fn();
 
         const crawler = new PuppeteerCrawler({
             requestQueue,
@@ -292,12 +278,10 @@ describe('PuppeteerCrawler', () => {
             requestHandler,
         });
 
-        // @ts-expect-error Overriding protected method
-        const logWarningSpy = jest.spyOn(crawler.log, 'warning');
+        const logWarningSpy = vitest.spyOn(crawler.log, 'warning');
         logWarningSpy.mockImplementation(() => {});
 
-        // @ts-expect-error Overriding protected method
-        const logErrorSpy = jest.spyOn(crawler.log, 'error');
+        const logErrorSpy = vitest.spyOn(crawler.log, 'error');
         logErrorSpy.mockImplementation(() => {});
 
         await crawler.run();
@@ -305,31 +289,17 @@ describe('PuppeteerCrawler', () => {
         await requestQueue.drop();
 
         expect(requestHandler).not.toBeCalled();
-        const warnings = logWarningSpy.mock.calls.map((call) => [call[0].split('\n')[0], call[1].retryCount]);
+        const warnings = logWarningSpy.mock.calls.map((call) => [call[0].split('\n')[0], call[1]!.retryCount]);
         expect(warnings).toEqual([
-            [
-                'Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.',
-                1,
-            ],
-            [
-                'Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.',
-                2,
-            ],
-            [
-                'Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.',
-                3,
-            ],
+            ['Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.', 1],
+            ['Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.', 2],
+            ['Reclaiming failed request back to the list or queue. Navigation timed out after 0.005 seconds.', 3],
         ]);
-        logWarningSpy.mockRestore();
 
-        const errors = logErrorSpy.mock.calls.map((call) => [call[0], call[1].retryCount]);
+        const errors = logErrorSpy.mock.calls.map((call) => [call[0], call[1]!.retryCount]);
         expect(errors).toEqual([
-            [
-                'Request failed and reached maximum retries. Navigation timed out after 0.005 seconds.',
-                undefined,
-            ],
+            ['Request failed and reached maximum retries. Navigation timed out after 0.005 seconds.', undefined],
         ]);
-        logErrorSpy.mockRestore();
     });
 
     test('should set cookies assigned to session to page', async () => {
@@ -358,7 +328,7 @@ describe('PuppeteerCrawler', () => {
             },
             requestHandler: async ({ page, session }) => {
                 pageCookies = await page.cookies().then((cks) => cks.map((c) => `${c.name}=${c.value}`).join('; '));
-                sessionCookies = session.getCookieString(serverUrl);
+                sessionCookies = session!.getCookieString(serverUrl);
             },
         });
 
@@ -389,8 +359,8 @@ describe('PuppeteerCrawler', () => {
             },
             proxyConfiguration,
             requestHandler: async ({ proxyInfo, session }) => {
-                proxies.add(proxyInfo.url);
-                sessions.add(session.id);
+                proxies.add(proxyInfo!.url);
+                sessions.add(session!.id);
             },
         });
 
@@ -439,7 +409,7 @@ describe('PuppeteerCrawler', () => {
                 browserPoolOptions: {
                     prePageCreateHooks: [
                         (_id, _controller, options) => {
-                            options.proxyBypassList = ['<-loopback>'];
+                            options!.proxyBypassList = ['<-loopback>'];
                         },
                     ],
                 },

@@ -1,24 +1,32 @@
+import type {
+    BrowserCrawlerOptions,
+    BrowserCrawlingContext,
+    BrowserHook,
+    BrowserRequestHandler,
+    GetUserDataFromRequest,
+    LoadedContext,
+    RouterRoutes,
+} from '@crawlee/browser';
+import { BrowserCrawler, Configuration, Router } from '@crawlee/browser';
+import type { BrowserPoolOptions, PlaywrightController, PlaywrightPlugin } from '@crawlee/browser-pool';
+import type { Dictionary } from '@crawlee/types';
 import ow from 'ow';
 import type { LaunchOptions, Page, Response } from 'playwright';
-import type { BrowserPoolOptions, PlaywrightController, PlaywrightPlugin } from '@crawlee/browser-pool';
-import type { BrowserCrawlerOptions, BrowserCrawlingContext, BrowserRequestHandler, BrowserHook } from '@crawlee/browser';
-import { BrowserCrawler, Configuration, Router } from '@crawlee/browser';
-import type { Dictionary } from '@crawlee/types';
+
 import type { PlaywrightLaunchContext } from './playwright-launcher';
 import { PlaywrightLauncher } from './playwright-launcher';
 import type { DirectNavigationOptions, PlaywrightContextUtils } from './utils/playwright-utils';
 import { gotoExtended, registerUtilsToContext } from './utils/playwright-utils';
 
-export interface PlaywrightCrawlingContext<UserData extends Dictionary = Dictionary> extends
-    BrowserCrawlingContext<PlaywrightCrawler, Page, Response, PlaywrightController, UserData>, PlaywrightContextUtils {}
+export interface PlaywrightCrawlingContext<UserData extends Dictionary = Dictionary>
+    extends BrowserCrawlingContext<PlaywrightCrawler, Page, Response, PlaywrightController, UserData>,
+        PlaywrightContextUtils {}
 export interface PlaywrightHook extends BrowserHook<PlaywrightCrawlingContext, PlaywrightGotoOptions> {}
-export interface PlaywrightRequestHandler extends BrowserRequestHandler<PlaywrightCrawlingContext> {}
+export interface PlaywrightRequestHandler extends BrowserRequestHandler<LoadedContext<PlaywrightCrawlingContext>> {}
 export type PlaywrightGotoOptions = Parameters<Page['goto']>[1];
 
-export interface PlaywrightCrawlerOptions extends BrowserCrawlerOptions<
-    PlaywrightCrawlingContext,
-    { browserPlugins: [PlaywrightPlugin] }
-> {
+export interface PlaywrightCrawlerOptions
+    extends BrowserCrawlerOptions<PlaywrightCrawlingContext, { browserPlugins: [PlaywrightPlugin] }> {
     /**
      * The same options as used by {@apilink launchPlaywright}.
      */
@@ -179,7 +187,11 @@ export interface PlaywrightCrawlerOptions extends BrowserCrawlerOptions<
  * ```
  * @category Crawlers
  */
-export class PlaywrightCrawler extends BrowserCrawler<{ browserPlugins: [PlaywrightPlugin] }, LaunchOptions, PlaywrightCrawlingContext> {
+export class PlaywrightCrawler extends BrowserCrawler<
+    { browserPlugins: [PlaywrightPlugin] },
+    LaunchOptions,
+    PlaywrightCrawlingContext
+> {
     protected static override optionsShape = {
         ...BrowserCrawler.optionsShape,
         browserPoolOptions: ow.optional.object,
@@ -189,51 +201,52 @@ export class PlaywrightCrawler extends BrowserCrawler<{ browserPlugins: [Playwri
     /**
      * All `PlaywrightCrawler` parameters are passed via an options object.
      */
-    constructor(options: PlaywrightCrawlerOptions = {}, override readonly config = Configuration.getGlobalConfig()) {
+    constructor(
+        private readonly options: PlaywrightCrawlerOptions = {},
+        override readonly config = Configuration.getGlobalConfig(),
+    ) {
         ow(options, 'PlaywrightCrawlerOptions', ow.object.exactShape(PlaywrightCrawler.optionsShape));
 
-        const {
-            launchContext = {},
-            headless,
-            ...browserCrawlerOptions
-        } = options;
+        const { launchContext = {}, headless, ...browserCrawlerOptions } = options;
 
         const browserPoolOptions = {
             ...options.browserPoolOptions,
         } as BrowserPoolOptions;
 
         if (launchContext.proxyUrl) {
-            throw new Error('PlaywrightCrawlerOptions.launchContext.proxyUrl is not allowed in PlaywrightCrawler.'
-                + 'Use PlaywrightCrawlerOptions.proxyConfiguration');
+            throw new Error(
+                'PlaywrightCrawlerOptions.launchContext.proxyUrl is not allowed in PlaywrightCrawler.' +
+                    'Use PlaywrightCrawlerOptions.proxyConfiguration',
+            );
         }
 
-        // `browserPlugins` is working when it's not overriden by `launchContext`,
-        // which for crawlers it is always overriden. Hence the error to use the other option.
+        // `browserPlugins` is working when it's not overridden by `launchContext`,
+        // which for crawlers it is always overridden. Hence the error to use the other option.
         if (browserPoolOptions.browserPlugins) {
             throw new Error('browserPoolOptions.browserPlugins is disallowed. Use launchContext.launcher instead.');
         }
 
         if (headless != null) {
             launchContext.launchOptions ??= {} as LaunchOptions;
-            launchContext.launchOptions.headless = headless;
+            launchContext.launchOptions.headless = headless as boolean;
         }
 
         const playwrightLauncher = new PlaywrightLauncher(launchContext, config);
 
-        browserPoolOptions.browserPlugins = [
-            playwrightLauncher.createBrowserPlugin(),
-        ];
+        browserPoolOptions.browserPlugins = [playwrightLauncher.createBrowserPlugin()];
 
         super({ ...browserCrawlerOptions, launchContext, browserPoolOptions }, config);
     }
 
     protected override async _runRequestHandler(context: PlaywrightCrawlingContext) {
-        registerUtilsToContext(context);
-        // eslint-disable-next-line no-underscore-dangle
+        registerUtilsToContext(context, this.options);
         await super._runRequestHandler(context);
     }
 
-    protected override async _navigationHandler(crawlingContext: PlaywrightCrawlingContext, gotoOptions: DirectNavigationOptions) {
+    protected override async _navigationHandler(
+        crawlingContext: PlaywrightCrawlingContext,
+        gotoOptions: DirectNavigationOptions,
+    ) {
         return gotoExtended(crawlingContext.page, crawlingContext.request, gotoOptions);
     }
 }
@@ -262,6 +275,9 @@ export class PlaywrightCrawler extends BrowserCrawler<{ browserPlugins: [Playwri
  * await crawler.run();
  * ```
  */
-export function createPlaywrightRouter<Context extends PlaywrightCrawlingContext = PlaywrightCrawlingContext>() {
-    return Router.create<Context>();
+export function createPlaywrightRouter<
+    Context extends PlaywrightCrawlingContext = PlaywrightCrawlingContext,
+    UserData extends Dictionary = GetUserDataFromRequest<Context['request']>,
+>(routes?: RouterRoutes<Context, UserData>) {
+    return Router.create<Context>(routes);
 }

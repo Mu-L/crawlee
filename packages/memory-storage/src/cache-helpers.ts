@@ -1,17 +1,23 @@
-import type * as storage from '@crawlee/types';
 import { access, opendir, readFile } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
+
+import type * as storage from '@crawlee/types';
+import json5 from 'json5';
 import mimeTypes from 'mime-types';
-import type { InternalKeyRecord } from './resource-clients/key-value-store';
-import type { InternalRequest } from './resource-clients/request-queue';
+
+import { DatasetFileSystemEntry } from './fs/dataset/fs';
+import { KeyValueFileSystemEntry } from './fs/key-value-store/fs';
+import { RequestQueueFileSystemEntry } from './fs/request-queue/fs';
+// eslint-disable-next-line import/order
 import type { MemoryStorage } from './memory-storage';
-import { memoryStorageLog } from './utils';
 
 const uuidRegex = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
 export async function findOrCacheDatasetByPossibleId(client: MemoryStorage, entryNameOrId: string) {
     // First check memory cache
-    const found = client.datasetClientsHandled.find((store) => store.id === entryNameOrId || store.name?.toLowerCase() === entryNameOrId.toLowerCase());
+    const found = client.datasetClientsHandled.find(
+        (store) => store.id === entryNameOrId || store.name?.toLowerCase() === entryNameOrId.toLowerCase(),
+    );
 
     if (found) {
         return found;
@@ -32,7 +38,9 @@ export async function findOrCacheDatasetByPossibleId(client: MemoryStorage, entr
     let id: string | undefined;
     let name: string | undefined;
     let itemCount = 0;
-    const entries = new Map<string, storage.Dictionary>();
+
+    const entries = new Set<string>();
+
     let createdAt = new Date();
     let accessedAt = new Date();
     let modifiedAt = new Date();
@@ -45,7 +53,10 @@ export async function findOrCacheDatasetByPossibleId(client: MemoryStorage, entr
                 hasSeenMetadataFile = true;
 
                 // we have found the store metadata file, build out information based on it
-                const metadata = JSON.parse(await readFile(resolve(datasetDir, entry.name), 'utf8')) as storage.DatasetInfo;
+                const fileContent = await readFile(resolve(datasetDir, entry.name), 'utf8');
+                if (!fileContent) continue;
+
+                const metadata = JSON.parse(fileContent) as storage.DatasetInfo;
                 id = metadata.id;
                 name = metadata.name;
                 itemCount = metadata.itemCount;
@@ -56,10 +67,8 @@ export async function findOrCacheDatasetByPossibleId(client: MemoryStorage, entr
                 continue;
             }
 
-            const entryContent = JSON.parse(await readFile(resolve(datasetDir, entry.name), 'utf8')) as storage.Dictionary;
             const entryName = entry.name.split('.')[0];
-
-            entries.set(entryName, entryContent);
+            entries.add(entryName);
 
             if (!hasSeenMetadataFile) {
                 itemCount++;
@@ -90,9 +99,16 @@ export async function findOrCacheDatasetByPossibleId(client: MemoryStorage, entr
     newClient.modifiedAt = modifiedAt;
     newClient.itemCount = itemCount;
 
-    for (const [entryId, content] of entries) {
+    for (const entryId of entries.values()) {
+        // We create a file system entry instead of possibly making an in-memory one to allow the pre-included data to be used on demand
+        const entry = new DatasetFileSystemEntry({
+            storeDirectory: datasetDir,
+            entityId: entryId,
+            persistStorage: true,
+        });
+
         // eslint-disable-next-line dot-notation
-        newClient['datasetEntries'].set(entryId, { ...content });
+        newClient['datasetEntries'].set(entryId, entry);
     }
 
     client.datasetClientsHandled.push(newClient);
@@ -102,7 +118,9 @@ export async function findOrCacheDatasetByPossibleId(client: MemoryStorage, entr
 
 export async function findOrCacheKeyValueStoreByPossibleId(client: MemoryStorage, entryNameOrId: string) {
     // First check memory cache
-    const found = client.keyValueStoresHandled.find((store) => store.id === entryNameOrId || store.name?.toLowerCase() === entryNameOrId.toLowerCase());
+    const found = client.keyValueStoresHandled.find(
+        (store) => store.id === entryNameOrId || store.name?.toLowerCase() === entryNameOrId.toLowerCase(),
+    );
 
     if (found) {
         return found;
@@ -125,13 +143,19 @@ export async function findOrCacheKeyValueStoreByPossibleId(client: MemoryStorage
     let createdAt = new Date();
     let accessedAt = new Date();
     let modifiedAt = new Date();
-    const internalRecords = new Map<string, InternalKeyRecord>();
+
+    type FsRecord = Omit<InternalKeyRecord, 'value'>;
+    const internalRecords = new Map<string, FsRecord>();
+    let hasSeenMetadataForEntry = false;
 
     for await (const entry of directoryEntries) {
         if (entry.isFile()) {
             if (entry.name === '__metadata__.json') {
                 // we have found the store metadata file, build out information based on it
-                const metadata = JSON.parse(await readFile(resolve(keyValueStoreDir, entry.name), 'utf8')) as storage.KeyValueStoreInfo;
+                const fileContent = await readFile(resolve(keyValueStoreDir, entry.name), 'utf8');
+                if (!fileContent) continue;
+
+                const metadata = JSON.parse(fileContent) as storage.KeyValueStoreInfo;
                 id = metadata.id;
                 name = metadata.name;
                 createdAt = new Date(metadata.createdAt);
@@ -142,46 +166,42 @@ export async function findOrCacheKeyValueStoreByPossibleId(client: MemoryStorage
             }
 
             if (entry.name.includes('.__metadata__.')) {
+                hasSeenMetadataForEntry = true;
+
                 // This is an entry's metadata file, we can use it to create/extend the record
-                const metadata = JSON.parse(await readFile(resolve(keyValueStoreDir, entry.name), 'utf8')) as Omit<InternalKeyRecord, 'value'>;
+                const fileContent = await readFile(resolve(keyValueStoreDir, entry.name), 'utf8');
+                if (!fileContent) continue;
+
+                const metadata = JSON.parse(fileContent) as FsRecord;
 
                 const newRecord = {
                     ...internalRecords.get(metadata.key),
                     ...metadata,
-                } as InternalKeyRecord;
+                } as FsRecord;
 
                 internalRecords.set(metadata.key, newRecord);
 
                 continue;
             }
 
+            // This is an entry in the store, we can use it to create/extend the record
             const fileContent = await readFile(resolve(keyValueStoreDir, entry.name));
             const fileExtension = extname(entry.name);
             const contentType = mimeTypes.contentType(entry.name) || 'text/plain';
             const extension = mimeTypes.extension(contentType) as string;
 
-            let finalFileContent: Buffer | string = fileContent;
-
-            if (!fileExtension) {
-                memoryStorageLog.warning([
-                    `Key-value entry "${entry.name}" for store ${entryNameOrId} does not have a file extension, assuming it as text.`,
-                    'If you want to have correct interpretation of the file, you should add a file extension to the entry.',
-                ].join('\n'));
-                finalFileContent = fileContent.toString('utf8');
-            } else if (contentType.includes('application/json')) {
+            // This is kept for backwards compatibility / to ignore invalid JSON files
+            if (contentType.includes('application/json')) {
                 const stringifiedJson = fileContent.toString('utf8');
+
                 try {
-                    // Try parsing the JSON ahead of time (not ideal but solves invalid files being loaded into stores)
-                    JSON.parse(stringifiedJson);
-                    finalFileContent = stringifiedJson;
+                    json5.parse(stringifiedJson);
                 } catch {
                     memoryStorageLog.warning(
                         `Key-value entry "${entry.name}" for store ${entryNameOrId} has invalid JSON content and will be ignored from the store.`,
                     );
                     continue;
                 }
-            } else if (contentType.includes('text/plain')) {
-                finalFileContent = fileContent.toString('utf8');
             }
 
             const nameSplit = entry.name.split('.');
@@ -192,13 +212,12 @@ export async function findOrCacheKeyValueStoreByPossibleId(client: MemoryStorage
 
             const key = nameSplit.join('.');
 
-            const newRecord: InternalKeyRecord = {
+            const newRecord = {
                 key,
                 extension,
-                value: finalFileContent,
                 contentType,
                 ...internalRecords.get(key),
-            };
+            } satisfies FsRecord;
 
             internalRecords.set(key, newRecord);
         }
@@ -227,8 +246,22 @@ export async function findOrCacheKeyValueStoreByPossibleId(client: MemoryStorage
     newClient.modifiedAt = modifiedAt;
 
     for (const [key, record] of internalRecords) {
+        // We create a file system entry instead of possibly making an in-memory one to allow the pre-included data to be used on demand
+        const entry = new KeyValueFileSystemEntry({
+            persistStorage: true,
+            storeDirectory: keyValueStoreDir,
+            writeMetadata: hasSeenMetadataForEntry,
+        });
+
         // eslint-disable-next-line dot-notation
-        newClient['keyValueEntries'].set(key, { ...record });
+        entry['rawRecord'] = { ...record };
+        // eslint-disable-next-line dot-notation
+        entry['filePath'] = resolve(keyValueStoreDir, `${record.key}.${record.extension}`);
+        // eslint-disable-next-line dot-notation
+        entry['fileMetadataPath'] = resolve(keyValueStoreDir, `${record.key}.__metadata__.json`);
+
+        // eslint-disable-next-line dot-notation
+        newClient['keyValueEntries'].set(key, entry);
     }
 
     client.keyValueStoresHandled.push(newClient);
@@ -238,7 +271,9 @@ export async function findOrCacheKeyValueStoreByPossibleId(client: MemoryStorage
 
 export async function findRequestQueueByPossibleId(client: MemoryStorage, entryNameOrId: string) {
     // First check memory cache
-    const found = client.requestQueuesHandled.find((store) => store.id === entryNameOrId || store.name?.toLowerCase() === entryNameOrId.toLowerCase());
+    const found = client.requestQueuesHandled.find(
+        (store) => store.id === entryNameOrId || store.name?.toLowerCase() === entryNameOrId.toLowerCase(),
+    );
 
     if (found) {
         return found;
@@ -263,14 +298,18 @@ export async function findRequestQueueByPossibleId(client: MemoryStorage, entryN
     let modifiedAt = new Date();
     let pendingRequestCount = 0;
     let handledRequestCount = 0;
-    const entries: InternalRequest[] = [];
+    const entries = new Set<string>();
+    let forefrontRequestIds: string[] = [];
 
     for await (const entry of directoryEntries) {
         if (entry.isFile()) {
             switch (entry.name) {
                 case '__metadata__.json': {
                     // we have found the store metadata file, build out information based on it
-                    const metadata = JSON.parse(await readFile(resolve(requestQueueDir, entry.name), 'utf8')) as storage.RequestQueueInfo;
+                    const fileContent = await readFile(resolve(requestQueueDir, entry.name), 'utf8');
+                    if (!fileContent) continue;
+
+                    const metadata = JSON.parse(fileContent) as storage.RequestQueueInfo;
 
                     id = metadata.id;
                     name = metadata.name;
@@ -279,12 +318,29 @@ export async function findRequestQueueByPossibleId(client: MemoryStorage, entryN
                     modifiedAt = new Date(metadata.modifiedAt);
                     pendingRequestCount = metadata.pendingRequestCount;
                     handledRequestCount = metadata.handledRequestCount;
+                    forefrontRequestIds = (metadata as any)?.forefrontRequestIds ?? [];
 
                     break;
                 }
                 default: {
-                    const request = JSON.parse(await readFile(resolve(requestQueueDir, entry.name), 'utf8')) as InternalRequest;
-                    entries.push(request);
+                    // Skip non-JSON and files that start with a dot
+                    if (entry.name.startsWith('.') || !entry.name.endsWith('.json')) {
+                        continue;
+                    }
+
+                    const entryName = entry.name.split('.')[0];
+
+                    try {
+                        // Try parsing the file to ensure it's even valid to begin with
+                        const fileContent = await readFile(resolve(requestQueueDir, entry.name), 'utf8');
+                        JSON.parse(fileContent);
+
+                        entries.add(entryName);
+                    } catch (err) {
+                        memoryStorageLog.warning(
+                            `Request queue entry "${entry.name}" for store ${entryNameOrId} has invalid JSON content and will be ignored from the store.`,
+                        );
+                    }
                 }
             }
         }
@@ -313,10 +369,18 @@ export async function findRequestQueueByPossibleId(client: MemoryStorage, entryN
     newClient.modifiedAt = modifiedAt;
     newClient.pendingRequestCount = pendingRequestCount;
     newClient.handledRequestCount = handledRequestCount;
+    // @ts-expect-error - Assigning to private property
+    newClient.forefrontRequestIds = forefrontRequestIds;
 
-    for (const entry of entries) {
+    for (const requestId of entries) {
+        const entry = new RequestQueueFileSystemEntry({
+            persistStorage: true,
+            requestId,
+            storeDirectory: requestQueueDir,
+        });
+
         // eslint-disable-next-line dot-notation
-        newClient['requests'].set(entry.id, entry);
+        newClient['requests'].set(requestId, entry);
     }
 
     client.requestQueuesHandled.push(newClient);
@@ -326,5 +390,7 @@ export async function findRequestQueueByPossibleId(client: MemoryStorage, entryN
 
 /* eslint-disable import/first -- Fixing circulars */
 import { DatasetClient } from './resource-clients/dataset';
+import type { InternalKeyRecord } from './resource-clients/key-value-store';
 import { KeyValueStoreClient } from './resource-clients/key-value-store';
 import { RequestQueueClient } from './resource-clients/request-queue';
+import { memoryStorageLog } from './utils';

@@ -1,20 +1,27 @@
 import { Actor } from 'apify';
 import { Dataset, PuppeteerCrawler } from '@crawlee/puppeteer';
-import { ApifyStorageLocal } from '@apify/storage-local';
 
 const mainOptions = {
     exit: Actor.isAtHome(),
-    storage: process.env.STORAGE_IMPLEMENTATION === 'LOCAL' ? new ApifyStorageLocal() : undefined,
+    storage:
+        process.env.STORAGE_IMPLEMENTATION === 'LOCAL'
+            ? new (await import('@apify/storage-local')).ApifyStorageLocal()
+            : undefined,
 };
 
 await Actor.main(async () => {
     const crawler = new PuppeteerCrawler({
-        launchContext: { launchOptions: { ignoreHTTPSErrors: true } },
-        preNavigationHooks: [(_ctx, goToOptions) => {
-            goToOptions.waitUntil = ['networkidle2'];
-        }],
+        launchContext: { launchOptions: { acceptInsecureCerts: true } },
+        preNavigationHooks: [
+            (_ctx, goToOptions) => {
+                goToOptions.waitUntil = ['networkidle2'];
+            },
+        ],
         async requestHandler({ page, enqueueLinks, request, log }) {
-            const { url, userData: { label } } = request;
+            const {
+                url,
+                userData: { label },
+            } = request;
 
             if (label === 'START') {
                 log.info('Bad ssl page opened!');

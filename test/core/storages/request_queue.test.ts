@@ -1,18 +1,40 @@
+/* eslint-disable dot-notation */
+
 import {
     QUERY_HEAD_MIN_LENGTH,
     API_PROCESSED_REQUESTS_DELAY_MILLIS,
     STORAGE_CONSISTENCY_DELAY_MILLIS,
-    RequestQueue,
+    RequestQueueV1 as RequestQueue,
+    RequestQueueV2,
     Request,
     Configuration,
+    ProxyConfiguration,
 } from '@crawlee/core';
 import { sleep } from '@crawlee/utils';
+import type { gotScraping } from '@crawlee/utils';
+import type { MockedFunction } from 'vitest';
+
+import { MemoryStorageEmulator } from '../../shared/MemoryStorageEmulator';
+
+vitest.mock('@crawlee/utils/src/internals/gotScraping', async () => {
+    return {
+        gotScraping: vitest.fn(),
+    };
+});
+
+let gotScrapingSpy: MockedFunction<typeof gotScraping>;
+
+beforeAll(async () => {
+    // @ts-ignore for some reason, this fails when the project is not built :/
+    const { gotScraping } = await import('@crawlee/utils');
+    gotScrapingSpy = vitest.mocked(gotScraping);
+});
 
 describe('RequestQueue remote', () => {
     const storageClient = Configuration.getStorageClient();
 
     beforeEach(() => {
-        jest.clearAllMocks();
+        vitest.clearAllMocks();
     });
 
     test('should work', async () => {
@@ -22,9 +44,7 @@ describe('RequestQueue remote', () => {
             wasAlreadyHandled: false,
             wasAlreadyPresent: false,
         };
-        const mockAddRequest = jest
-            .spyOn(queue.client, 'addRequest')
-            .mockResolvedValueOnce(firstResolveValue);
+        const mockAddRequest = vitest.spyOn(queue.client, 'addRequest').mockResolvedValueOnce(firstResolveValue);
 
         const requestOptions = { url: 'http://example.com/a' };
         const queueOperationInfo1 = await queue.addRequest(requestOptions);
@@ -32,8 +52,8 @@ describe('RequestQueue remote', () => {
         expect(queueOperationInfo1).toMatchObject({
             ...firstResolveValue,
         });
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
         expect(mockAddRequest).toBeCalledTimes(1);
         expect(mockAddRequest).toBeCalledWith(requestA, { forefront: false });
 
@@ -44,8 +64,8 @@ describe('RequestQueue remote', () => {
             wasAlreadyHandled: false,
             requestId: 'a',
         });
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
 
         const requestB = new Request({ url: 'http://example.com/b' });
         const secondResolveValue = {
@@ -58,34 +78,33 @@ describe('RequestQueue remote', () => {
         await queue.addRequest(requestB, { forefront: true });
         expect(mockAddRequest).toBeCalledTimes(2);
         expect(mockAddRequest).toHaveBeenLastCalledWith(requestB, { forefront: true });
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(2);
+
+        expect(queue['queueHeadIds'].length()).toBe(2);
         expect(queue.inProgressCount()).toBe(0);
 
         // Forefronted request was added to the queue.
-        const mockGetRequest = jest.spyOn(queue.client, 'getRequest');
+        const mockGetRequest = vitest.spyOn(queue.client, 'getRequest');
         mockGetRequest.mockResolvedValueOnce({ ...requestB, id: 'b' });
 
         const requestBFromQueue = await queue.fetchNextRequest();
         expect(mockGetRequest).toBeCalledTimes(1);
         expect(mockGetRequest).toHaveBeenLastCalledWith('b');
         expect(requestBFromQueue).toEqual({ ...requestB, id: 'b' });
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
         expect(queue.inProgressCount()).toBe(1);
 
         // Test validations
-        await queue.markRequestHandled(new Request({ id: 'XXX', url: 'https://example.com' }))
-            .catch((err) => expect(err.message).toMatch(/Cannot mark request XXX as handled, because it is not in progress/));
-        await queue.reclaimRequest(new Request({ id: 'XXX', url: 'https://example.com' }))
-            .catch((err) => expect(err.message).toMatch(/Cannot reclaim request XXX, because it is not in progress/));
-        await queue.addRequest(new Request({ id: 'id-already-set', url: 'https://example.com' }))
-            .catch((err) => expect(err.message).toMatch(
-                'Expected property `id` to be of type `undefined` but received type `string` in object',
-            ));
+        await queue
+            .addRequest(new Request({ id: 'id-already-set', url: 'https://example.com' }))
+            .catch((err) =>
+                expect(err.message).toMatch(
+                    'Expected property `id` to be of type `undefined` but received type `string` in object',
+                ),
+            );
 
-        // getRequest() returns null if object was not found.
-        mockGetRequest.mockResolvedValueOnce(null);
+        // getRequest() returns undefined if object was not found.
+        mockGetRequest.mockResolvedValueOnce(undefined);
 
         const requestXFromQueue = await queue.getRequest('non-existent');
         expect(mockGetRequest).toBeCalledTimes(2);
@@ -93,7 +112,7 @@ describe('RequestQueue remote', () => {
         expect(requestXFromQueue).toBe(null);
 
         // Reclaim it.
-        const mockUpdateRequest = jest.spyOn(queue.client, 'updateRequest');
+        const mockUpdateRequest = vitest.spyOn(queue.client, 'updateRequest');
         mockUpdateRequest.mockResolvedValueOnce({
             requestId: 'b',
             wasAlreadyHandled: false,
@@ -103,15 +122,15 @@ describe('RequestQueue remote', () => {
             request: requestBFromQueue,
         });
 
-        await queue.reclaimRequest(requestBFromQueue, { forefront: true });
+        await queue.reclaimRequest(requestBFromQueue!, { forefront: true });
         expect(mockUpdateRequest).toBeCalledTimes(1);
         expect(mockUpdateRequest).toHaveBeenLastCalledWith(requestBFromQueue, { forefront: true });
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
         expect(queue.inProgressCount()).toBe(1);
         await sleep(STORAGE_CONSISTENCY_DELAY_MILLIS + 10);
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(2);
+
+        expect(queue['queueHeadIds'].length()).toBe(2);
         expect(queue.inProgressCount()).toBe(0);
 
         // Fetch again.
@@ -121,8 +140,8 @@ describe('RequestQueue remote', () => {
         expect(mockGetRequest).toBeCalledTimes(3);
         expect(mockGetRequest).toHaveBeenLastCalledWith('b');
         expect(requestBFromQueue2).toEqual(requestBFromQueue);
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
         expect(queue.inProgressCount()).toBe(1);
 
         // Mark handled.
@@ -135,19 +154,19 @@ describe('RequestQueue remote', () => {
             request: requestBFromQueue,
         });
 
-        await queue.markRequestHandled(requestBFromQueue);
+        await queue.markRequestHandled(requestBFromQueue!);
         expect(mockUpdateRequest).toBeCalledTimes(2);
         expect(mockUpdateRequest).toHaveBeenLastCalledWith(requestBFromQueue);
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
         expect(queue.inProgressCount()).toBe(0);
 
         // Emulate there are no cached items in queue
-        // @ts-expect-error Accessing private property
-        queue.queueHeadDict.clear();
+
+        queue['queueHeadIds'].clear();
 
         // Query queue head.
-        const mockListHead = jest.spyOn(queue.client, 'listHead');
+        const mockListHead = vitest.spyOn(queue.client, 'listHead');
         mockListHead.mockResolvedValueOnce({
             items: [
                 { id: 'a', uniqueKey: 'aaa' },
@@ -162,12 +181,12 @@ describe('RequestQueue remote', () => {
         expect(mockListHead).toBeCalledTimes(1);
         expect(mockListHead).toHaveBeenLastCalledWith({ limit: QUERY_HEAD_MIN_LENGTH });
         expect(requestAFromQueue).toEqual({ ...requestA, id: 'a' });
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
         expect(queue.inProgressCount()).toBe(1);
 
         // Drop queue.
-        const mockDelete = jest.spyOn(queue.client, 'delete');
+        const mockDelete = vitest.spyOn(queue.client, 'delete');
         mockDelete.mockResolvedValueOnce(undefined);
 
         await queue.drop();
@@ -177,7 +196,7 @@ describe('RequestQueue remote', () => {
 
     test('addRequests', async () => {
         const queue = new RequestQueue({ id: 'batch-requests', client: storageClient });
-        const mockAddRequests = jest.spyOn(queue.client, 'batchAddRequests');
+        const mockAddRequests = vitest.spyOn(queue.client, 'batchAddRequests');
 
         const requestOptions = { url: 'http://example.com/a' };
         const requestA = new Request(requestOptions);
@@ -202,8 +221,8 @@ describe('RequestQueue remote', () => {
         });
 
         // Ensure the client method was actually called, and added
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
         expect(mockAddRequests).toBeCalledTimes(1);
         expect(mockAddRequests).toBeCalledWith([requestA], { forefront: false });
 
@@ -214,8 +233,8 @@ describe('RequestQueue remote', () => {
             ...firstRequestAdded,
             wasAlreadyPresent: true,
         });
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
 
         // Adding more requests, forefront
         const requestB = new Request({ url: 'http://example.com/b' });
@@ -253,8 +272,8 @@ describe('RequestQueue remote', () => {
             wasAlreadyHandled: false,
             wasAlreadyPresent: false,
         });
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(3);
+
+        expect(queue['queueHeadIds'].length()).toBe(3);
         expect(mockAddRequests).toHaveBeenCalled();
         expect(mockAddRequests).toBeCalledWith([requestB, requestC], { forefront: true });
     });
@@ -266,7 +285,7 @@ describe('RequestQueue remote', () => {
         const requestB = new Request({ url: 'http://example.com/a' }); // Has same uniqueKey as A
 
         // Add request A
-        const addRequestMock = jest.spyOn(queue.client, 'addRequest');
+        const addRequestMock = vitest.spyOn(queue.client, 'addRequest');
         addRequestMock.mockResolvedValueOnce({
             requestId: 'a',
             wasAlreadyHandled: false,
@@ -296,7 +315,7 @@ describe('RequestQueue remote', () => {
         const requestY = new Request({ url: 'http://example.com/x' }); // Has same uniqueKey as X
 
         // Add request X.
-        const addRequestMock = jest.spyOn(queue.client, 'addRequest');
+        const addRequestMock = vitest.spyOn(queue.client, 'addRequest');
         addRequestMock.mockResolvedValueOnce({
             requestId: 'x',
             wasAlreadyHandled: true,
@@ -323,11 +342,9 @@ describe('RequestQueue remote', () => {
         const queue = new RequestQueue({ id: 'some-id', client: storageClient });
 
         // Query queue head with request A
-        const listHeadMock = jest.spyOn(queue.client, 'listHead');
+        const listHeadMock = vitest.spyOn(queue.client, 'listHead');
         listHeadMock.mockResolvedValueOnce({
-            items: [
-                { id: 'a', uniqueKey: 'aaa' },
-            ],
+            items: [{ id: 'a', uniqueKey: 'aaa' }],
         } as never);
 
         expect(await queue.isEmpty()).toBe(false);
@@ -336,7 +353,7 @@ describe('RequestQueue remote', () => {
 
         // Add request A and addRequest is not called because was already cached.
         const requestA = new Request({ url: 'http://example.com/a', uniqueKey: 'aaa' });
-        const addRequestMock = jest.spyOn(queue.client, 'addRequest');
+        const addRequestMock = vitest.spyOn(queue.client, 'addRequest');
 
         const queueOperationInfo = await queue.addRequest(requestA);
         expect(addRequestMock).toBeCalledTimes(0);
@@ -350,12 +367,12 @@ describe('RequestQueue remote', () => {
 
     test('should handle situation when newly created request is not available yet', async () => {
         const queue = new RequestQueue({ id: 'some-id', name: 'some-queue', client: storageClient });
-        const listHeadMock = jest.spyOn(queue.client, 'listHead');
+        const listHeadMock = vitest.spyOn(queue.client, 'listHead');
 
         const requestA = new Request({ url: 'http://example.com/a' });
 
         // Add request A
-        const addRequestMock = jest.spyOn(queue.client, 'addRequest');
+        const addRequestMock = vitest.spyOn(queue.client, 'addRequest');
         addRequestMock.mockResolvedValueOnce({
             requestId: 'a',
             wasAlreadyHandled: false,
@@ -365,11 +382,11 @@ describe('RequestQueue remote', () => {
         await queue.addRequest(requestA, { forefront: true });
         expect(addRequestMock).toBeCalledTimes(1);
         expect(addRequestMock).toHaveBeenLastCalledWith(requestA, { forefront: true });
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
 
         // Try to get requestA which is not available yet.
-        const getRequestMock = jest.spyOn(queue.client, 'getRequest');
+        const getRequestMock = vitest.spyOn(queue.client, 'getRequest');
         getRequestMock.mockResolvedValueOnce(undefined);
 
         const fetchedRequest = await queue.fetchNextRequest();
@@ -388,9 +405,7 @@ describe('RequestQueue remote', () => {
         });
 
         listHeadMock.mockResolvedValueOnce({
-            items: [
-                { id: 'a', uniqueKey: 'aaa' },
-            ],
+            items: [{ id: 'a', uniqueKey: 'aaa' }],
         } as never);
 
         const fetchedRequest2 = await queue.fetchNextRequest();
@@ -406,16 +421,16 @@ describe('RequestQueue remote', () => {
 
         const requestA = new Request({ url: 'http://example.com/a' });
 
-        const addRequestMock = jest.spyOn(queue.client, 'addRequest');
+        const addRequestMock = vitest.spyOn(queue.client, 'addRequest');
         addRequestMock.mockResolvedValueOnce({
             requestId: 'a',
             wasAlreadyHandled: true,
             wasAlreadyPresent: true,
         });
 
-        const getRequestMock = jest.spyOn(queue.client, 'getRequest');
+        const getRequestMock = vitest.spyOn(queue.client, 'getRequest');
 
-        const listHeadMock = jest.spyOn(queue.client, 'listHead');
+        const listHeadMock = vitest.spyOn(queue.client, 'listHead');
         listHeadMock.mockResolvedValueOnce({
             items: [],
         } as never);
@@ -433,7 +448,7 @@ describe('RequestQueue remote', () => {
 
     test('should accept plain object in addRequest()', async () => {
         const queue = new RequestQueue({ id: 'some-id', client: storageClient });
-        const addRequestMock = jest.spyOn(queue.client, 'addRequest');
+        const addRequestMock = vitest.spyOn(queue.client, 'addRequest');
         addRequestMock.mockResolvedValueOnce({
             requestId: 'xxx',
             wasAlreadyHandled: false,
@@ -448,7 +463,7 @@ describe('RequestQueue remote', () => {
 
     test('should return correct handledCount', async () => {
         const queue = new RequestQueue({ id: 'id', client: storageClient });
-        const getMock = jest.spyOn(queue.client, 'get');
+        const getMock = vitest.spyOn(queue.client, 'get');
         getMock.mockResolvedValueOnce({
             handledRequestCount: 33,
         } as never);
@@ -462,7 +477,7 @@ describe('RequestQueue remote', () => {
         const queue = new RequestQueue({ id: 'some-id', name: 'some-name', client: storageClient });
 
         // Return head with modifiedAt = now so it will retry the call.
-        const listHeadMock = jest.spyOn(queue.client, 'listHead');
+        const listHeadMock = vitest.spyOn(queue.client, 'listHead');
         listHeadMock.mockResolvedValueOnce({
             limit: 5,
             queueModifiedAt: new Date(Date.now() - API_PROCESSED_REQUESTS_DELAY_MILLIS * 0.75),
@@ -495,15 +510,14 @@ describe('RequestQueue remote', () => {
         const requestAWithId = { ...requestA, id: 'a' } as Request;
         const requestB = new Request({ url: 'http://example.com/b' });
         const requestBWithId = { ...requestB, id: 'b' } as Request;
-        const addRequestMock = jest.spyOn(queue.client, 'addRequest');
+        const addRequestMock = vitest.spyOn(queue.client, 'addRequest');
         addRequestMock.mockResolvedValueOnce({ requestId: 'a', wasAlreadyHandled: false, wasAlreadyPresent: false });
         addRequestMock.mockResolvedValueOnce({ requestId: 'b', wasAlreadyHandled: false, wasAlreadyPresent: false });
 
         await queue.addRequest(requestA, { forefront: true });
         await queue.addRequest(requestB, { forefront: true });
 
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(2);
+        expect(queue['queueHeadIds'].length()).toBe(2);
         expect(queue.inProgressCount()).toBe(0);
         expect(queue.assumedTotalCount).toBe(2);
         expect(queue.assumedHandledCount).toBe(0);
@@ -512,14 +526,14 @@ describe('RequestQueue remote', () => {
         expect(addRequestMock).toHaveBeenNthCalledWith(2, requestB, { forefront: true });
 
         // It won't query the head as there is something in progress or pending.
-        const listHeadMock = jest.spyOn(queue.client, 'listHead');
+        const listHeadMock = vitest.spyOn(queue.client, 'listHead');
 
         const isFinished = await queue.isFinished();
         expect(isFinished).toBe(false);
         expect(listHeadMock).not.toBeCalled();
 
         // Fetch them from queue.
-        const getRequestMock = jest.spyOn(queue.client, 'getRequest');
+        const getRequestMock = vitest.spyOn(queue.client, 'getRequest');
         getRequestMock.mockResolvedValueOnce({ ...requestB, id: 'b' });
         getRequestMock.mockResolvedValueOnce({ ...requestA, id: 'a' });
 
@@ -532,8 +546,7 @@ describe('RequestQueue remote', () => {
         expect(getRequestMock).toBeCalledTimes(2);
         expect(getRequestMock).toHaveBeenLastCalledWith('a');
 
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(0);
+        expect(queue['queueHeadIds'].length()).toBe(0);
         expect(queue.inProgressCount()).toBe(2);
         expect(queue.assumedTotalCount).toBe(2);
         expect(queue.assumedHandledCount).toBe(0);
@@ -543,7 +556,7 @@ describe('RequestQueue remote', () => {
         expect(listHeadMock).not.toBeCalled();
 
         // Reclaim one and mark another one handled.
-        const updateRequestMock = jest.spyOn(queue.client, 'updateRequest');
+        const updateRequestMock = vitest.spyOn(queue.client, 'updateRequest');
         updateRequestMock.mockResolvedValueOnce({ requestId: 'b', wasAlreadyHandled: false, wasAlreadyPresent: true });
 
         await queue.markRequestHandled(requestBWithId);
@@ -555,14 +568,14 @@ describe('RequestQueue remote', () => {
         await queue.reclaimRequest(requestAWithId, { forefront: true });
         expect(updateRequestMock).toBeCalledTimes(2);
         expect(updateRequestMock).toHaveBeenLastCalledWith(requestAWithId, { forefront: true });
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(0);
+
+        expect(queue['queueHeadIds'].length()).toBe(0);
         expect(queue.inProgressCount()).toBe(1);
         expect(queue.assumedTotalCount).toBe(2);
         expect(queue.assumedHandledCount).toBe(1);
         await sleep(STORAGE_CONSISTENCY_DELAY_MILLIS + 10);
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(1);
+
+        expect(queue['queueHeadIds'].length()).toBe(1);
         expect(queue.inProgressCount()).toBe(0);
         expect(queue.assumedTotalCount).toBe(2);
         expect(queue.assumedHandledCount).toBe(1);
@@ -581,8 +594,7 @@ describe('RequestQueue remote', () => {
         expect(getRequestMock).toBeCalledTimes(3);
         expect(getRequestMock).toHaveBeenLastCalledWith('a');
 
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(0);
+        expect(queue['queueHeadIds'].length()).toBe(0);
         expect(queue.inProgressCount()).toBe(1);
         expect(queue.assumedTotalCount).toBe(2);
         expect(queue.assumedHandledCount).toBe(1);
@@ -598,8 +610,7 @@ describe('RequestQueue remote', () => {
         expect(updateRequestMock).toBeCalledTimes(3);
         expect(updateRequestMock).toHaveBeenLastCalledWith(requestAWithId);
 
-        // @ts-expect-error Accessing private property
-        expect(queue.queueHeadDict.length()).toBe(0);
+        expect(queue['queueHeadIds'].length()).toBe(0);
         expect(queue.inProgressCount()).toBe(0);
         expect(queue.assumedTotalCount).toBe(2);
         expect(queue.assumedHandledCount).toBe(2);
@@ -616,6 +627,42 @@ describe('RequestQueue remote', () => {
         expect(await queue.isFinished()).toBe(true);
         expect(listHeadMock).toBeCalledTimes(1);
         expect(listHeadMock).toHaveBeenLastCalledWith({ limit: QUERY_HEAD_MIN_LENGTH });
+    });
+
+    test('`fetchNextRequest` order respects `forefront` enqueues', async () => {
+        const emulator = new MemoryStorageEmulator();
+
+        await emulator.init();
+        const queue = await RequestQueue.open();
+
+        const retrievedUrls: string[] = [];
+
+        await queue.addRequests([
+            { url: 'http://example.com/1' },
+            { url: 'http://example.com/5' },
+            { url: 'http://example.com/6' },
+        ]);
+
+        retrievedUrls.push((await queue.fetchNextRequest())!.url);
+
+        await queue.addRequest({ url: 'http://example.com/4' }, { forefront: true });
+        await queue.addRequest({ url: 'http://example.com/3' }, { forefront: true });
+
+        await queue.addRequest({ url: 'http://example.com/2' }, { forefront: true });
+
+        let req = await queue.fetchNextRequest();
+
+        expect(req!.url).toBe('http://example.com/2');
+
+        await queue.reclaimRequest(req!, { forefront: true });
+
+        while (req) {
+            retrievedUrls.push(req!.url);
+            req = await queue.fetchNextRequest();
+        }
+
+        expect(retrievedUrls.map((x) => new URL(x).pathname)).toEqual(['/1', '/2', '/3', '/4', '/5', '/6']);
+        await emulator.destroy();
     });
 
     test('getInfo() should work', async () => {
@@ -635,9 +682,7 @@ describe('RequestQueue remote', () => {
             hadMultipleClients: false,
         };
 
-        const getMock = jest
-            .spyOn(queue.client, 'get')
-            .mockResolvedValueOnce(expected);
+        const getMock = vitest.spyOn(queue.client, 'get').mockResolvedValueOnce(expected);
 
         const result = await queue.getInfo();
         expect(result).toEqual(expected);
@@ -647,9 +692,7 @@ describe('RequestQueue remote', () => {
 
     test('drop() works', async () => {
         const queue = new RequestQueue({ id: 'some-id', name: 'some-name', client: storageClient });
-        const deleteMock = jest
-            .spyOn(queue.client, 'delete')
-            .mockResolvedValueOnce(undefined);
+        const deleteMock = vitest.spyOn(queue.client, 'delete').mockResolvedValueOnce(undefined);
 
         await queue.drop();
         expect(deleteMock).toBeCalledTimes(1);
@@ -662,26 +705,305 @@ describe('RequestQueue remote', () => {
         const r1 = new Request({
             url,
             method,
-            userData: { __crawlee: { skipNavigation: true, foo: 123, bar: true } },
+            userData: { __crawlee: { skipNavigation: true, maxRetries: 10, foo: 123, bar: true } },
         });
         const r2 = new Request({
             url,
             method,
-            userData: {},
+            userData: {} as any,
         });
         const r3 = new Request({
             url,
             method,
         });
         const desc1 = Object.getOwnPropertyDescriptor(r1.userData, '__crawlee');
-        expect(desc1.enumerable).toBe(false);
+        expect(desc1!.enumerable).toBe(false);
         expect(r1.skipNavigation).toBe(true);
-        expect(r1.userData.__crawlee).toMatchObject({ skipNavigation: true, foo: 123, bar: true });
+        expect(r1.maxRetries).toBe(10);
+        r1.maxRetries = 5;
+        expect(r1.userData.__crawlee).toMatchObject({ skipNavigation: true, maxRetries: 5, foo: 123, bar: true });
         const desc2 = Object.getOwnPropertyDescriptor(r2.userData, '__crawlee');
-        expect(desc2.enumerable).toBe(false);
+        expect(desc2!.enumerable).toBe(false);
+        expect(r2.maxRetries).toBeUndefined();
         expect(r2.userData.__crawlee).toEqual({});
         const desc3 = Object.getOwnPropertyDescriptor(r3.userData, '__crawlee');
-        expect(desc3.enumerable).toBe(false);
+        expect(desc3!.enumerable).toBe(false);
+        expect(r3.maxRetries).toBeUndefined();
         expect(r3.userData.__crawlee).toEqual({});
+        r3.maxRetries = 2;
+        expect(r3.userData.__crawlee).toEqual({ maxRetries: 2 });
+    });
+});
+
+describe('RequestQueue with requestsFromUrl', () => {
+    const emulator = new MemoryStorageEmulator();
+
+    beforeEach(async () => {
+        await emulator.init();
+        vitest.restoreAllMocks();
+    });
+
+    afterAll(async () => {
+        await emulator.destroy();
+    });
+
+    test('should correctly load list from hosted files in correct order', async () => {
+        const spy = vitest.spyOn(RequestQueue.prototype as any, '_downloadListOfUrls');
+        const list1 = ['https://example.com', 'https://google.com', 'https://wired.com'];
+        const list2 = ['https://another.com', 'https://page.com'];
+        spy.mockImplementationOnce(() => new Promise((resolve) => setTimeout(resolve(list1) as any, 100)) as any);
+        spy.mockResolvedValueOnce(list2);
+
+        const queue = await RequestQueue.open();
+        await queue.addRequests([
+            { method: 'GET', requestsFromUrl: 'http://example.com/list-1' },
+            { method: 'POST', requestsFromUrl: 'http://example.com/list-2' },
+        ]);
+
+        expect(await queue.fetchNextRequest()).toMatchObject({ method: 'GET', url: list1[0] });
+        expect(await queue.fetchNextRequest()).toMatchObject({ method: 'GET', url: list1[1] });
+        expect(await queue.fetchNextRequest()).toMatchObject({ method: 'GET', url: list1[2] });
+        expect(await queue.fetchNextRequest()).toMatchObject({ method: 'POST', url: list2[0] });
+        expect(await queue.fetchNextRequest()).toMatchObject({ method: 'POST', url: list2[1] });
+
+        expect(spy).toBeCalledTimes(2);
+        expect(spy).toBeCalledWith({ url: 'http://example.com/list-1', urlRegExp: undefined });
+        expect(spy).toBeCalledWith({ url: 'http://example.com/list-2', urlRegExp: undefined });
+    });
+
+    test('should use regex parameter to parse urls', async () => {
+        const listStr = 'kjnjkn"https://example.com/a/b/c?q=1#abc";,"HTTP://google.com/a/b/c";dgg:dd';
+        const listArr = ['https://example.com', 'HTTP://google.com'];
+        gotScrapingSpy.mockResolvedValue({ body: listStr } as any);
+
+        const regex = /(https:\/\/example.com|HTTP:\/\/google.com)/g;
+        const queue = await RequestQueue.open();
+        await queue.addRequest({
+            method: 'GET',
+            requestsFromUrl: 'http://example.com/list-1',
+            regex,
+        });
+
+        expect(await queue.fetchNextRequest()).toMatchObject({ method: 'GET', url: listArr[0] });
+        expect(await queue.fetchNextRequest()).toMatchObject({ method: 'GET', url: listArr[1] });
+        await queue.drop();
+
+        expect(gotScrapingSpy).toBeCalledWith({ url: 'http://example.com/list-1', encoding: 'utf8' });
+    });
+
+    test('should fix gdoc sharing url in `requestsFromUrl` automatically (GH issue #639)', async () => {
+        const list = ['https://example.com', 'https://google.com', 'https://wired.com'];
+        const wrongUrls = [
+            'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU',
+            'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/',
+            'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/edit?usp=sharing',
+            'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/123123132',
+            'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/?q=blablabla',
+            'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/edit#gid=0',
+        ];
+        const correctUrl =
+            'https://docs.google.com/spreadsheets/d/11UGSBOSXy5Ov2WEP9nr4kSIxQJmH18zh-5onKtBsovU/gviz/tq?tqx=out:csv';
+
+        gotScrapingSpy.mockResolvedValue({ body: JSON.stringify(list) } as any);
+
+        const queue = await RequestQueue.open();
+        await queue.addRequests(wrongUrls.map((requestsFromUrl) => ({ requestsFromUrl })));
+
+        expect(await queue.fetchNextRequest()).toMatchObject({ method: 'GET', url: list[0] });
+        expect(await queue.fetchNextRequest()).toMatchObject({ method: 'GET', url: list[1] });
+        expect(await queue.fetchNextRequest()).toMatchObject({ method: 'GET', url: list[2] });
+
+        expect(gotScrapingSpy).toBeCalledWith({ url: correctUrl, encoding: 'utf8' });
+        await queue.drop();
+    });
+
+    test('should handle requestsFromUrl with no URLs', async () => {
+        const spy = vitest.spyOn(RequestQueue.prototype as any, '_downloadListOfUrls');
+        spy.mockResolvedValueOnce([]);
+
+        const queue = await RequestQueue.open();
+        await queue.addRequest({
+            method: 'GET',
+            requestsFromUrl: 'http://example.com/list-1',
+        });
+
+        expect(await queue.fetchNextRequest()).toBe(null);
+
+        expect(spy).toBeCalledTimes(1);
+        expect(spy).toBeCalledWith({ url: 'http://example.com/list-1', urlRegExp: undefined });
+    });
+
+    test('should use the defined proxy server when using `requestsFromUrl`', async () => {
+        const proxyUrls = ['http://proxyurl.usedforthe.download', 'http://another.proxy.url'];
+
+        const spy = vitest.spyOn(RequestQueue.prototype as any, '_downloadListOfUrls');
+        spy.mockResolvedValue([]);
+
+        const proxyConfiguration = new ProxyConfiguration({
+            proxyUrls,
+        });
+
+        const queue = await RequestQueue.open(null, { proxyConfiguration });
+        await queue.addRequests([
+            { requestsFromUrl: 'http://example.com/list-1' },
+            { requestsFromUrl: 'http://example.com/list-2' },
+            { requestsFromUrl: 'http://example.com/list-3' },
+        ]);
+
+        expect(spy).not.toBeCalledWith(expect.not.objectContaining({ proxyUrl: expect.any(String) }));
+    });
+});
+
+describe('RequestQueue v2', () => {
+    const totalRequestsPerTest = 50;
+
+    function calculateHistogram(requests: { uniqueKey: string }[]): number[] {
+        const histogram: number[] = [];
+        for (const item of requests) {
+            const key = item.uniqueKey;
+            const index = parseInt(key, 10);
+            histogram[index] = histogram[index] ? histogram[index] + 1 : 1;
+        }
+
+        return histogram;
+    }
+
+    async function getEmptyQueue(name: string) {
+        const queue = await RequestQueueV2.open(name);
+        await queue.drop();
+        return RequestQueueV2.open(name);
+    }
+
+    function getUniqueRequests(count: number) {
+        return new Array(count)
+            .fill(0)
+            .map((_, i) => new Request({ url: `http://example.com/${i}`, uniqueKey: String(i) }));
+    }
+
+    test('listAndLockHead works as expected', async () => {
+        const queue = await getEmptyQueue('list-and-lock-head');
+        await queue.addRequests(getUniqueRequests(totalRequestsPerTest));
+
+        const [{ items: firstFetch }, { items: secondFetch }] = await Promise.all([
+            queue.client.listAndLockHead({ limit: totalRequestsPerTest / 2, lockSecs: 60 }),
+            queue.client.listAndLockHead({ limit: totalRequestsPerTest / 2, lockSecs: 60 }),
+        ]);
+
+        const histogram = calculateHistogram([...firstFetch, ...secondFetch]);
+        expect(histogram).toEqual(Array(totalRequestsPerTest).fill(1));
+    });
+
+    test('lock timers work as expected (timeout unlocks)', async () => {
+        vitest.useFakeTimers();
+        const queue = await getEmptyQueue('lock-timers');
+        await queue.addRequests(getUniqueRequests(totalRequestsPerTest));
+
+        const { items: firstFetch } = await queue.client.listAndLockHead({
+            limit: totalRequestsPerTest / 2,
+            lockSecs: 60,
+        });
+
+        vitest.advanceTimersByTime(65000);
+
+        const { items: secondFetch } = await queue.client.listAndLockHead({
+            limit: totalRequestsPerTest / 2,
+            lockSecs: 60,
+        });
+
+        const histogram = calculateHistogram([...firstFetch, ...secondFetch]);
+        expect(histogram).toEqual(Array(totalRequestsPerTest / 2).fill(2));
+        vitest.useRealTimers();
+    });
+
+    test('prolongRequestLock works as expected ', async () => {
+        vitest.useFakeTimers();
+        const queue = await getEmptyQueue('prolong-request-lock');
+        await queue.addRequests(getUniqueRequests(1));
+
+        const { items: firstFetch } = await queue.client.listAndLockHead({ limit: 1, lockSecs: 60 });
+        await queue.client.prolongRequestLock(firstFetch[0].id, { lockSecs: 60 });
+        expect(firstFetch).toHaveLength(1);
+
+        vitest.advanceTimersByTime(65000);
+        const { items: secondFetch } = await queue.client.listAndLockHead({ limit: 1, lockSecs: 60 });
+        expect(secondFetch).toHaveLength(0);
+
+        vitest.advanceTimersByTime(65000);
+        const { items: thirdFetch } = await queue.client.listAndLockHead({ limit: 1, lockSecs: 60 });
+
+        expect(thirdFetch).toHaveLength(1);
+        vitest.useRealTimers();
+    });
+
+    test('deleteRequestLock works as expected', async () => {
+        const queue = await getEmptyQueue('delete-request-lock');
+        await queue.addRequests(getUniqueRequests(1));
+
+        const { items: firstFetch } = await queue.client.listAndLockHead({ limit: 1, lockSecs: 60 });
+        await queue.client.deleteRequestLock(firstFetch[0].id);
+
+        const { items: secondFetch } = await queue.client.listAndLockHead({ limit: 1, lockSecs: 60 });
+
+        expect(secondFetch[0]).toEqual(firstFetch[0]);
+    });
+
+    test('`fetchNextRequest` order respects `forefront` enqueues', async () => {
+        const queue = await getEmptyQueue('fetch-next-request-order');
+
+        const retrievedUrls: string[] = [];
+
+        await queue.addRequests([
+            { url: 'http://example.com/1' },
+            ...Array.from({ length: 25 }, (_, i) => ({ url: `http://example.com/${i + 4}` })),
+        ]);
+
+        retrievedUrls.push((await queue.fetchNextRequest())!.url);
+
+        await queue.addRequest({ url: 'http://example.com/3' }, { forefront: true });
+        await queue.addRequest({ url: 'http://example.com/2' }, { forefront: true });
+
+        let req = await queue.fetchNextRequest();
+
+        while (req) {
+            retrievedUrls.push(req!.url);
+            req = await queue.fetchNextRequest();
+        }
+
+        // 28 requests exceed the RQv2 batch size limit of 25, so we can examine the request ordering
+        expect(retrievedUrls.map((x) => new URL(x).pathname)).toEqual(
+            Array.from({ length: 28 }, (_, i) => `/${i + 1}`),
+        );
+    });
+
+    test('`reclaimRequest` with `forefront` respects the request ordering', async () => {
+        const queue = await getEmptyQueue('fetch-next-request-order-reclaim');
+
+        const retrievedUrls: string[] = [];
+
+        await queue.addRequests([
+            { url: 'http://example.com/1' },
+            { url: 'http://example.com/4' },
+            { url: 'http://example.com/5' },
+        ]);
+
+        retrievedUrls.push((await queue.fetchNextRequest())!.url);
+
+        await queue.addRequest({ url: 'http://example.com/3' }, { forefront: true });
+        await queue.addRequest({ url: 'http://example.com/2' }, { forefront: true });
+
+        let req = await queue.fetchNextRequest();
+
+        expect(req!.url).toBe('http://example.com/2');
+
+        await queue.reclaimRequest(req!, { forefront: true });
+
+        req = await queue.fetchNextRequest();
+
+        while (req) {
+            retrievedUrls.push(req!.url);
+            req = await queue.fetchNextRequest();
+        }
+
+        expect(retrievedUrls.map((x) => new URL(x).pathname)).toEqual(Array.from({ length: 5 }, (_, i) => `/${i + 1}`));
     });
 });

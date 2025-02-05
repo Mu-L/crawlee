@@ -1,6 +1,7 @@
+import { PassThrough } from 'stream';
+
 import { maybeStringify, Configuration, KeyValueStore } from '@crawlee/core';
 import type { Dictionary } from '@crawlee/utils';
-import { PassThrough } from 'stream';
 import { MemoryStorageEmulator } from 'test/shared/MemoryStorageEmulator';
 
 const localStorageEmulator = new MemoryStorageEmulator();
@@ -17,7 +18,7 @@ describe('KeyValueStore', () => {
     const client = Configuration.getStorageClient();
 
     beforeEach(async () => {
-        jest.clearAllMocks();
+        vitest.clearAllMocks();
     });
 
     test('should work', async () => {
@@ -31,10 +32,10 @@ describe('KeyValueStore', () => {
         const recordStr = JSON.stringify(record, null, 2);
 
         // Set record
-        const mockSetRecord = jest
+        const mockSetRecord = vitest
             // @ts-expect-error Accessing private property
             .spyOn(store.client, 'setRecord')
-            .mockResolvedValueOnce(null);
+            .mockResolvedValueOnce(undefined);
 
         await store.setValue('key-1', record);
 
@@ -46,7 +47,7 @@ describe('KeyValueStore', () => {
         });
 
         // Get Record
-        const mockGetRecord = jest
+        const mockGetRecord = vitest
             // @ts-expect-error Accessing private property
             .spyOn(store.client, 'getRecord')
             .mockResolvedValueOnce({
@@ -61,11 +62,23 @@ describe('KeyValueStore', () => {
         expect(mockGetRecord).toBeCalledWith('key-1');
         expect(response).toEqual(record);
 
+        // Record Exists
+        const mockRecordExists = vitest
+            // @ts-expect-error Accessing private property
+            .spyOn(store.client, 'recordExists')
+            .mockResolvedValueOnce(true);
+
+        const exists = await store.recordExists('key-1');
+
+        expect(mockRecordExists).toBeCalledTimes(1);
+        expect(mockRecordExists).toBeCalledWith('key-1');
+        expect(exists).toBe(true);
+
         // Delete Record
-        const mockDeleteRecord = jest
+        const mockDeleteRecord = vitest
             // @ts-expect-error Accessing private property
             .spyOn(store.client, 'deleteRecord')
-            .mockResolvedValueOnce(null);
+            .mockResolvedValueOnce(undefined);
 
         await store.setValue('key-1', null);
 
@@ -73,7 +86,7 @@ describe('KeyValueStore', () => {
         expect(mockDeleteRecord).toBeCalledWith('key-1');
 
         // Drop store
-        const mockDelete = jest
+        const mockDelete = vitest
             // @ts-expect-error Accessing private property
             .spyOn(store.client, 'delete')
             .mockResolvedValueOnce(undefined);
@@ -92,15 +105,22 @@ describe('KeyValueStore', () => {
             });
 
             // @ts-expect-error JS-side validation
-            await expect(store.getValue()).rejects.toThrow('Expected argument to be of type `string` but received type `undefined`');
+            await expect(store.getValue()).rejects.toThrow(
+                'Expected argument to be of type `string` but received type `undefined`',
+            );
             // @ts-expect-error JS-side validation
-            await expect(store.getValue({})).rejects.toThrow('Expected argument to be of type `string` but received type `Object`');
-            await expect(store.getValue(null)).rejects.toThrow('Expected argument to be of type `string` but received type `null`');
+            await expect(store.getValue({})).rejects.toThrow(
+                'Expected argument to be of type `string` but received type `Object`',
+            );
+            // @ts-expect-error JS-side validation
+            await expect(store.getValue(null)).rejects.toThrow(
+                'Expected argument to be of type `string` but received type `null`',
+            );
             await expect(store.getValue('')).rejects.toThrow('Expected string to not be empty');
         });
 
         test('KeyValueStore.getValue()', async () => {
-            const getValueSpy = jest.spyOn(KeyValueStore.prototype, 'getValue');
+            const getValueSpy = vitest.spyOn(KeyValueStore.prototype, 'getValue');
             getValueSpy.mockImplementationOnce(async () => 123);
 
             const val = await KeyValueStore.getValue('key-1');
@@ -115,6 +135,39 @@ describe('KeyValueStore', () => {
         });
     });
 
+    describe('recordExists', () => {
+        test('throws on invalid args', async () => {
+            const store = new KeyValueStore({
+                id: 'some-id-1',
+                client,
+            });
+
+            // @ts-expect-error JS-side validation
+            await expect(store.recordExists()).rejects.toThrow(
+                'Expected argument to be of type `string` but received type `undefined`',
+            );
+            // @ts-expect-error JS-side validation
+            await expect(store.recordExists({})).rejects.toThrow(
+                'Expected argument to be of type `string` but received type `Object`',
+            );
+            // @ts-expect-error JS-side validation
+            await expect(store.recordExists(null)).rejects.toThrow(
+                'Expected argument to be of type `string` but received type `null`',
+            );
+            await expect(store.recordExists('')).rejects.toThrow('Expected string to not be empty');
+        });
+
+        test('KeyValueStore.recordExists()', async () => {
+            const recordExistsSpy = vitest.spyOn(KeyValueStore.prototype, 'recordExists');
+            recordExistsSpy.mockImplementationOnce(async () => false);
+
+            const val = await KeyValueStore.recordExists('key-1');
+            expect(recordExistsSpy).toBeCalledTimes(1);
+            expect(recordExistsSpy).toBeCalledWith('key-1');
+            expect(val).toBe(false);
+        });
+    });
+
     describe('setValue', () => {
         test('throws on invalid args', async () => {
             const store = new KeyValueStore({
@@ -123,60 +176,76 @@ describe('KeyValueStore', () => {
             });
 
             // @ts-expect-error JS-side validation
-            await expect(store.setValue()).rejects.toThrow('Expected `key` to be of type `string` but received type `undefined`');
+            await expect(store.setValue()).rejects.toThrow(
+                'Expected `key` to be of type `string` but received type `undefined`',
+            );
             await expect(store.setValue('', null)).rejects.toThrow('Expected string `key` to not be empty');
             await expect(store.setValue('', 'some value')).rejects.toThrow('Expected string `key` to not be empty');
             // @ts-expect-error JS-side validation
-            await expect(store.setValue({}, 'some value'))
-                .rejects.toThrow('Expected `key` to be of type `string` but received type `Object`');
+            await expect(store.setValue({}, 'some value')).rejects.toThrow(
+                'Expected `key` to be of type `string` but received type `Object`',
+            );
             // @ts-expect-error JS-side validation
-            await expect(store.setValue(123, 'some value'))
-                .rejects.toThrow('Expected `key` to be of type `string` but received type `number`');
+            await expect(store.setValue(123, 'some value')).rejects.toThrow(
+                'Expected `key` to be of type `string` but received type `number`',
+            );
 
-            const valueErrMsg = 'The "value" parameter must be a String, Buffer or Stream when "options.contentType" is specified';
+            const valueErrMsg =
+                'The "value" parameter must be a String, Buffer or Stream when "options.contentType" is specified';
             await expect(store.setValue('key', {}, { contentType: 'image/png' })).rejects.toThrow(valueErrMsg);
             await expect(store.setValue('key', 12345, { contentType: 'image/png' })).rejects.toThrow(valueErrMsg);
             await expect(store.setValue('key', () => {}, { contentType: 'image/png' })).rejects.toThrow(valueErrMsg);
 
             // @ts-expect-error JS-side validation
-            await expect(store.setValue('key', {}, 123))
-                .rejects.toThrow('Expected argument to be of type `object` but received type `number`');
+            await expect(store.setValue('key', {}, 123)).rejects.toThrow(
+                'Expected argument to be of type `object` but received type `number`',
+            );
             // @ts-expect-error JS-side validation
-            await expect(store.setValue('key', {}, 'bla/bla'))
-                .rejects.toThrow('Expected argument to be of type `object` but received type `string`');
+            await expect(store.setValue('key', {}, 'bla/bla')).rejects.toThrow(
+                'Expected argument to be of type `object` but received type `string`',
+            );
             // @ts-expect-error JS-side validation
-            await expect(store.setValue('key', {}, true))
-                .rejects.toThrow('Expected argument to be of type `object` but received type `boolean`');
+            await expect(store.setValue('key', {}, true)).rejects.toThrow(
+                'Expected argument to be of type `object` but received type `boolean`',
+            );
 
             const circularObj = {} as Dictionary;
             circularObj.xxx = circularObj;
-            const circularErrMsg = 'The "value" parameter cannot be stringified to JSON: Converting circular structure to JSON';
-            const undefinedErrMsg = 'The "value" parameter was stringified to JSON and returned undefined. '
-                + 'Make sure you\'re not trying to stringify an undefined value.';
+            const circularErrMsg =
+                'The "value" parameter cannot be stringified to JSON: Converting circular structure to JSON';
+            const undefinedErrMsg =
+                'The "value" parameter was stringified to JSON and returned undefined. ' +
+                "Make sure you're not trying to stringify an undefined value.";
             await expect(store.setValue('key', circularObj)).rejects.toThrow(circularErrMsg);
             await expect(store.setValue('key', undefined)).rejects.toThrow(undefinedErrMsg);
             // @ts-expect-error JS-side validation
             await expect(store.setValue('key')).rejects.toThrow(undefinedErrMsg);
 
             const contTypeRedundantErrMsg = 'Expected property string `contentType` to not be empty in object';
-            await expect(store.setValue('key', null, { contentType: 'image/png' }))
-                .rejects.toThrow('The "value" parameter must be a String, Buffer or Stream when "options.contentType" is specified.');
+            await expect(store.setValue('key', null, { contentType: 'image/png' })).rejects.toThrow(
+                'The "value" parameter must be a String, Buffer or Stream when "options.contentType" is specified.',
+            );
             await expect(store.setValue('key', null, { contentType: '' })).rejects.toThrow(contTypeRedundantErrMsg);
             // @ts-expect-error Type '{}' is not assignable to type 'string'.
-            await expect(store.setValue('key', null, { contentType: {} }))
-                .rejects.toThrow('The "value" parameter must be a String, Buffer or Stream when "options.contentType" is specified.');
+            await expect(store.setValue('key', null, { contentType: {} })).rejects.toThrow(
+                'The "value" parameter must be a String, Buffer or Stream when "options.contentType" is specified.',
+            );
 
             // @ts-expect-error Type 'number' is not assignable to type 'string'.
-            await expect(store.setValue('key', 'value', { contentType: 123 }))
-                .rejects.toThrow('Expected property `contentType` to be of type `string` but received type `number` in object');
+            await expect(store.setValue('key', 'value', { contentType: 123 })).rejects.toThrow(
+                'Expected property `contentType` to be of type `string` but received type `number` in object',
+            );
             // @ts-expect-error Type '{}' is not assignable to type 'string'.
-            await expect(store.setValue('key', 'value', { contentType: {} }))
-                .rejects.toThrow('Expected property `contentType` to be of type `string` but received type `Object` in object');
+            await expect(store.setValue('key', 'value', { contentType: {} })).rejects.toThrow(
+                'Expected property `contentType` to be of type `string` but received type `Object` in object',
+            );
             // @ts-expect-error Type 'Date' is not assignable to type 'string'.
-            await expect(store.setValue('key', 'value', { contentType: new Date() }))
-                .rejects.toThrow('Expected property `contentType` to be of type `string` but received type `Date` in object');
-            await expect(store.setValue('key', 'value', { contentType: '' }))
-                .rejects.toThrow('Expected property string `contentType` to not be empty in object');
+            await expect(store.setValue('key', 'value', { contentType: new Date() })).rejects.toThrow(
+                'Expected property `contentType` to be of type `string` but received type `Date` in object',
+            );
+            await expect(store.setValue('key', 'value', { contentType: '' })).rejects.toThrow(
+                'Expected property string `contentType` to not be empty in object',
+            );
         });
 
         test('throws on invalid key', async () => {
@@ -186,26 +255,16 @@ describe('KeyValueStore', () => {
             });
 
             const INVALID_CHARACTERS = '?|\\/"*<>%:';
-            let counter = 0;
-
             for (const char of INVALID_CHARACTERS) {
-                try {
-                    await store.setValue(`my_id_${char}`, 'value');
-                } catch (err) {
-                    if ((err as Error).message.match('The "key" argument must be at most 256 characters')) counter++;
-                }
+                const key = `my_id_${char}`;
+                const err = `The "key" argument "${key}" must be at most 256 characters`;
+                await expect(store.setValue(key, 'value')).rejects.toThrow(err);
             }
-            expect(counter).toEqual(INVALID_CHARACTERS.length);
-
-            // TODO: This throws "ENAMETOOLONG: name too long, unlink" !!!
-            // await store.setValue('X'.repeat(256), 'value');
 
             // test max length
-            try {
-                await store.setValue('X'.repeat(257), 'value');
-            } catch (err) {
-                if ((err as Error).message.match('The "key" parameter must be at most 256 characters')) counter++;
-            }
+            const longKey = 'X'.repeat(257);
+            const err = `The "key" argument "${longKey}" must be at most 256 characters`;
+            await expect(store.setValue(longKey, '...')).rejects.toThrow(err);
         });
 
         test('correctly adds charset to content type', async () => {
@@ -214,10 +273,10 @@ describe('KeyValueStore', () => {
                 client,
             });
 
-            const mockSetRecord = jest
+            const mockSetRecord = vitest
                 // @ts-expect-error Accessing private property
                 .spyOn(store.client, 'setRecord')
-                .mockResolvedValueOnce(null);
+                .mockResolvedValueOnce(undefined);
 
             await store.setValue('key-1', 'xxxx', { contentType: 'text/plain; charset=utf-8' });
 
@@ -238,10 +297,10 @@ describe('KeyValueStore', () => {
             const record = { foo: 'bar' };
             const recordStr = JSON.stringify(record, null, 2);
 
-            const mockSetRecord = jest
+            const mockSetRecord = vitest
                 // @ts-expect-error Accessing private property
                 .spyOn(store.client, 'setRecord')
-                .mockResolvedValueOnce(null);
+                .mockResolvedValueOnce(undefined);
 
             await store.setValue('key-1', record);
 
@@ -259,10 +318,10 @@ describe('KeyValueStore', () => {
                 client,
             });
 
-            const mockSetRecord = jest
+            const mockSetRecord = vitest
                 // @ts-expect-error Accessing private property
                 .spyOn(store.client, 'setRecord')
-                .mockResolvedValueOnce(null);
+                .mockResolvedValueOnce(undefined);
 
             await store.setValue('key-1', 'xxxx', { contentType: 'text/plain; charset=utf-8' });
 
@@ -280,10 +339,10 @@ describe('KeyValueStore', () => {
                 client,
             });
 
-            const mockSetRecord = jest
+            const mockSetRecord = vitest
                 // @ts-expect-error Accessing private property
                 .spyOn(store.client, 'setRecord')
-                .mockResolvedValueOnce(null);
+                .mockResolvedValueOnce(undefined);
 
             const value = Buffer.from('some text value');
             await store.setValue('key-1', value, { contentType: 'image/jpeg; charset=something' });
@@ -302,10 +361,10 @@ describe('KeyValueStore', () => {
                 client,
             });
 
-            const mockSetRecord = jest
-            // @ts-expect-error Accessing private property
+            const mockSetRecord = vitest
+                // @ts-expect-error Accessing private property
                 .spyOn(store.client, 'setRecord')
-                .mockResolvedValueOnce(null);
+                .mockResolvedValueOnce(undefined);
 
             const value = new PassThrough();
             await store.setValue('key-1', value, { contentType: 'plain/text' });
@@ -341,7 +400,7 @@ describe('KeyValueStore', () => {
 
     describe('maybeStringify()', () => {
         test('should work', () => {
-            expect(maybeStringify({ foo: 'bar' }, { contentType: null })).toBe('{\n  "foo": "bar"\n}');
+            expect(maybeStringify({ foo: 'bar' }, { contentType: null as any })).toBe('{\n  "foo": "bar"\n}');
             expect(maybeStringify({ foo: 'bar' }, { contentType: undefined })).toBe('{\n  "foo": "bar"\n}');
 
             expect(maybeStringify('xxx', { contentType: undefined })).toBe('"xxx"');
@@ -349,7 +408,7 @@ describe('KeyValueStore', () => {
 
             const obj = {} as Dictionary;
             obj.self = obj;
-            expect(() => maybeStringify(obj, { contentType: null })).toThrowError(
+            expect(() => maybeStringify(obj, { contentType: null as any })).toThrowError(
                 'The "value" parameter cannot be stringified to JSON: Converting circular structure to JSON',
             );
         });
@@ -388,7 +447,7 @@ describe('KeyValueStore', () => {
             });
 
             // @ts-expect-error Accessing private property
-            const mockListKeys = jest.spyOn(store.client, 'listKeys');
+            const mockListKeys = vitest.spyOn(store.client, 'listKeys');
             mockListKeys.mockResolvedValueOnce({
                 isTruncated: true,
                 exclusiveStartKey: 'key0',
@@ -416,16 +475,19 @@ describe('KeyValueStore', () => {
             mockListKeys.mockResolvedValueOnce({
                 isTruncated: false,
                 exclusiveStartKey: 'key0',
-                nextExclusiveStartKey: null,
+                nextExclusiveStartKey: undefined,
                 items: [{ key: 'key5', size: 5 }],
                 count: 1,
                 limit: 1,
             });
 
             const results: [string, number, { size: number }][] = [];
-            await store.forEachKey(async (key, index, info) => {
-                results.push([key, index, info]);
-            }, { exclusiveStartKey: 'key0' });
+            await store.forEachKey(
+                async (key, index, info) => {
+                    results.push([key, index, info]);
+                },
+                { exclusiveStartKey: 'key0' },
+            );
 
             expect(mockListKeys).toBeCalledTimes(3);
             expect(mockListKeys).toHaveBeenNthCalledWith(1, { exclusiveStartKey: 'key0' });

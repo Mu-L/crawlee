@@ -1,8 +1,9 @@
 import { EventEmitter } from 'events';
+
+import log from '@apify/log';
+import type { Dictionary } from '@crawlee/utils';
 import ow from 'ow';
 import type { HTTPRequest, HTTPRequest as PuppeteerRequest, Page } from 'puppeteer';
-import type { Dictionary } from '@crawlee/utils';
-import log from '@apify/log';
 
 // We use weak maps here so that the content gets discarded after page gets closed.
 const pageInterceptRequestHandlersMap: WeakMap<Page, InterceptHandler[]> = new WeakMap(); // Maps page to an array of request interception handlers.
@@ -42,7 +43,8 @@ function browserifyHeaders(headers: Record<string, string>): Record<string, stri
     const finalHeaders: Dictionary<string> = {};
     // eslint-disable-next-line prefer-const
     for (let [key, value] of Object.entries(headers)) {
-        key = key.toLowerCase()
+        key = key
+            .toLowerCase()
             .split('-')
             .map((str) => str.charAt(0).toUpperCase() + str.slice(1))
             .join('-');
@@ -201,9 +203,7 @@ export async function removeInterceptRequestHandler(page: Page, handler: Interce
     ow(page, ow.object.hasKeys('goto', 'evaluate'));
     ow(handler, ow.function);
 
-    const handlersArray = pageInterceptRequestHandlersMap
-        .get(page)!
-        .filter((item) => item !== handler);
+    const handlersArray = pageInterceptRequestHandlersMap.get(page)!.filter((item) => item !== handler);
 
     pageInterceptRequestHandlersMap.set(page, handlersArray);
 

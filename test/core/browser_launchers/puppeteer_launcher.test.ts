@@ -1,22 +1,23 @@
 import fs from 'fs';
-import path from 'path';
-// @ts-expect-error no types
-import proxy from 'proxy';
 import type { Server } from 'http';
 import http from 'http';
+import type { AddressInfo } from 'net';
+import path from 'path';
 import util from 'util';
+
+import { BrowserLauncher, launchPuppeteer } from '@crawlee/puppeteer';
+import type { Dictionary } from '@crawlee/utils';
+// @ts-expect-error no types
+import basicAuthParser from 'basic-auth-parser';
 // @ts-expect-error no types
 import portastic from 'portastic';
 // @ts-expect-error no types
-import basicAuthParser from 'basic-auth-parser';
-import express from 'express';
-import { BrowserLauncher, launchPuppeteer } from '@crawlee/puppeteer';
-import type { Dictionary } from '@crawlee/utils';
-import type { AddressInfo } from 'net';
+import proxy from 'proxy';
 import type { Browser, Page } from 'puppeteer';
-import { runExampleComServer, startExpressAppPromise } from '../../shared/_helper';
 
-let prevEnvHeadless: string;
+import { runExampleComServer } from '../../shared/_helper';
+
+let prevEnvHeadless: string | undefined;
 let proxyServer: Server;
 let proxyPort: number;
 const proxyAuth = { scheme: 'Basic', username: 'username', password: 'password' };
@@ -40,7 +41,7 @@ beforeAll(() => {
     process.env.CRAWLEE_HEADLESS = '1';
 
     // Find free port for the proxy
-    return portastic.find({ min: 50100, max: 50199 }).then((ports: number[]) => {
+    return portastic.find({ min: 50100, max: 50199 }).then(async (ports: number[]) => {
         return new Promise<void>((resolve, reject) => {
             const httpServer = http.createServer();
 
@@ -116,27 +117,27 @@ describe('launchPuppeteer()', () => {
         await Promise.all(closePromises);
     });
 
-    test('opens a webpage', () => {
+    test('opens a webpage', async () => {
         let browser: Browser;
         let page: Page;
 
         return launchPuppeteer()
-            .then((createdBrowser) => {
+            .then(async (createdBrowser) => {
                 browser = createdBrowser;
 
                 return browser.newPage();
             })
-            .then((openedPage) => {
+            .then(async (openedPage) => {
                 page = openedPage;
 
                 return page.goto(serverAddress);
             })
-            .then(() => page.content())
+            .then(async () => page.content())
             .then((html) => expect(html).toMatch('<h1>Example Domain</h1>'))
-            .then(() => browser.close());
+            .then(async () => browser.close());
     });
 
-    test.skip('opens a webpage via proxy with authentication', () => {
+    test.skip('opens a webpage via proxy with authentication', async () => {
         let browser: Browser;
         let page: Page;
 
@@ -147,26 +148,26 @@ describe('launchPuppeteer()', () => {
             launchOptions: { headless: true },
             proxyUrl: `http://username:password@127.0.0.1:${proxyPort}`,
         })
-            .then((createdBrowser) => {
+            .then(async (createdBrowser) => {
                 browser = createdBrowser;
 
                 return browser.newPage();
             })
-            .then((openedPage) => {
+            .then(async (openedPage) => {
                 page = openedPage;
 
                 return page.goto(serverAddress);
             })
-            .then(() => {
+            .then(async () => {
                 expect(wasProxyCalled).toBe(true);
 
                 return page.content();
             })
             .then((html) => expect(html).toMatch('<h1>Example Domain</h1>'))
-            .then(() => browser.close());
+            .then(async () => browser.close());
     });
 
-    test('supports userAgent option', () => {
+    test('supports userAgent option', async () => {
         let browser: Browser;
         let page: Page;
 
@@ -180,24 +181,24 @@ describe('launchPuppeteer()', () => {
             .then((result) => {
                 browser = result;
             })
-            .then(() => {
+            .then(async () => {
                 return browser.newPage();
             })
-            .then((result) => {
+            .then(async (result) => {
                 page = result;
                 return page.goto(`${serverAddress}/special/getDebug`);
             })
-            .then(() => {
+            .then(async () => {
                 return page.content();
             })
-            .then((html) => {
+            .then(async (html) => {
                 expect(html).toMatch(`"user-agent":"${opts.userAgent}"`);
                 return browser.close();
             });
     });
 
     test('supports useChrome option', async () => {
-        const spy = jest.spyOn(BrowserLauncher.prototype as any, '_getTypicalChromeExecutablePath');
+        const spy = vitest.spyOn(BrowserLauncher.prototype as any, '_getTypicalChromeExecutablePath');
 
         let browser;
         const opts = {
@@ -209,7 +210,7 @@ describe('launchPuppeteer()', () => {
             browser = await launchPuppeteer(opts);
             const page = await browser.newPage();
 
-            await page.setDefaultNavigationTimeout(0);
+            page.setDefaultNavigationTimeout(0);
 
             // Add a test to go to an actual domain because we've seen issues
             // where pages would not load at all with Chrome.
@@ -222,7 +223,6 @@ describe('launchPuppeteer()', () => {
             expect(version).not.toMatch('Chromium');
             expect(spy).toBeCalledTimes(1);
         } finally {
-            spy.mockRestore();
             if (browser) await browser.close();
         }
     });

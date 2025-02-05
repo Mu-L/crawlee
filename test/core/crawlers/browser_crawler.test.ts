@@ -1,41 +1,26 @@
+import type { Server } from 'http';
+
 import { ENV_VARS } from '@apify/consts';
-import { BROWSER_POOL_EVENTS, BrowserPool, OperatingSystemsName, PuppeteerPlugin } from '@crawlee/browser-pool';
-import type { HTTPResponse } from 'puppeteer';
-import puppeteer from 'puppeteer';
 import log from '@apify/log';
-import type {
-    PuppeteerCrawlingContext,
-    PuppeteerGoToOptions,
-    PuppeteerRequestHandler,
-} from '@crawlee/puppeteer';
+import { BROWSER_POOL_EVENTS, BrowserPool, OperatingSystemsName, PuppeteerPlugin } from '@crawlee/browser-pool';
+import { BLOCKED_STATUS_CODES } from '@crawlee/core';
+import type { PuppeteerCrawlingContext, PuppeteerGoToOptions, PuppeteerRequestHandler } from '@crawlee/puppeteer';
 import {
     AutoscaledPool,
+    EnqueueStrategy,
     ProxyConfiguration,
     Request,
     RequestList,
     RequestState,
     Session,
 } from '@crawlee/puppeteer';
-import { gotScraping } from 'got-scraping';
 import { sleep } from '@crawlee/utils';
-import { MemoryStorageEmulator } from 'test/shared/MemoryStorageEmulator';
+import puppeteer from 'puppeteer';
+import type { HTTPResponse } from 'puppeteer';
 import { runExampleComServer } from 'test/shared/_helper';
-import type { Server } from 'http';
+import { MemoryStorageEmulator } from 'test/shared/MemoryStorageEmulator';
+
 import { BrowserCrawlerTest } from './basic_browser_crawler';
-
-jest.mock('got-scraping', () => {
-    const original: typeof import('got-scraping') = jest.requireActual('got-scraping');
-    return {
-        ...original,
-        gotScraping: jest.fn(),
-    };
-});
-
-const gotScrapingSpy = gotScraping as jest.MockedFunction<typeof gotScraping>;
-
-afterAll(() => {
-    jest.unmock('got-scraping');
-});
 
 describe('BrowserCrawler', () => {
     let prevEnvHeadless: string;
@@ -48,7 +33,7 @@ describe('BrowserCrawler', () => {
     let server: Server;
 
     beforeAll(async () => {
-        prevEnvHeadless = process.env.CRAWLEE_HEADLESS;
+        prevEnvHeadless = process.env.CRAWLEE_HEADLESS!;
         process.env.CRAWLEE_HEADLESS = '1';
         logLevel = log.getLevel();
         log.setLevel(log.LEVELS.ERROR);
@@ -63,7 +48,7 @@ describe('BrowserCrawler', () => {
     });
 
     afterEach(async () => {
-        puppeteerPlugin = null;
+        puppeteerPlugin = null as any;
     });
 
     afterAll(async () => {
@@ -89,7 +74,7 @@ describe('BrowserCrawler', () => {
         const requestHandler: PuppeteerRequestHandler = async ({ page, request, response }) => {
             await page.waitForSelector('title');
 
-            expect(response.status()).toBe(200);
+            expect(response!.status()).toBe(200);
             request.userData.title = await page.title();
             processed.push(request);
         };
@@ -109,7 +94,7 @@ describe('BrowserCrawler', () => {
 
         await browserCrawler.run();
 
-        expect(browserCrawler.autoscaledPool.minConcurrency).toBe(1);
+        expect(browserCrawler.autoscaledPool!.minConcurrency).toBe(1);
         expect(processed).toHaveLength(6);
         expect(failed).toHaveLength(0);
 
@@ -118,11 +103,10 @@ describe('BrowserCrawler', () => {
             expect(request.userData.title).toBe('Example Domain');
         });
     });
+
     test('should teardown browser pool', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: 'http://example.com/?q=1' },
-            ],
+            sources: [{ url: 'http://example.com/?q=1' }],
         });
         const browserCrawler = new BrowserCrawlerTest({
             browserPoolOptions: {
@@ -133,7 +117,7 @@ describe('BrowserCrawler', () => {
             requestHandler: async () => {},
             maxRequestRetries: 1,
         });
-        jest.spyOn(browserCrawler.browserPool, 'destroy');
+        vitest.spyOn(browserCrawler.browserPool, 'destroy');
 
         await browserCrawler.run();
         expect(browserCrawler.browserPool.destroy).toBeCalled();
@@ -141,19 +125,19 @@ describe('BrowserCrawler', () => {
 
     test('should retire session after TimeoutError', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: 'http://example.com/?q=1' },
-            ],
+            sources: [{ url: 'http://example.com/?q=1' }],
         });
         class TimeoutError extends Error {}
-        let sessionGoto: Session;
-        const browserCrawler = new class extends BrowserCrawlerTest {
-            protected override _navigationHandler(ctx: PuppeteerCrawlingContext): Promise<HTTPResponse | null | undefined> {
-                jest.spyOn(ctx.session, 'markBad');
-                sessionGoto = ctx.session;
+        let sessionGoto!: Session;
+        const browserCrawler = new (class extends BrowserCrawlerTest {
+            protected override async _navigationHandler(
+                ctx: PuppeteerCrawlingContext,
+            ): Promise<HTTPResponse | null | undefined> {
+                vitest.spyOn(ctx.session!, 'markBad');
+                sessionGoto = ctx.session!;
                 throw new TimeoutError();
             }
-        }({
+        })({
             browserPoolOptions: {
                 browserPlugins: [puppeteerPlugin],
             },
@@ -169,18 +153,19 @@ describe('BrowserCrawler', () => {
 
     test('should evaluate preNavigationHooks', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: 'http://example.com/?q=1' },
-            ],
+            sources: [{ url: 'http://example.com/?q=1' }],
         });
         let isEvaluated = false;
 
-        const browserCrawler = new class extends BrowserCrawlerTest {
-            protected override _navigationHandler(ctx: PuppeteerCrawlingContext, gotoOptions: PuppeteerGoToOptions): Promise<HTTPResponse | null | undefined> {
+        const browserCrawler = new (class extends BrowserCrawlerTest {
+            protected override async _navigationHandler(
+                ctx: PuppeteerCrawlingContext,
+                gotoOptions: PuppeteerGoToOptions,
+            ): Promise<HTTPResponse | null | undefined> {
                 isEvaluated = ctx.hookFinished as boolean;
                 return ctx.page.goto(ctx.request.url, gotoOptions);
             }
-        }({
+        })({
             browserPoolOptions: {
                 browserPlugins: [puppeteerPlugin],
             },
@@ -203,9 +188,7 @@ describe('BrowserCrawler', () => {
 
     test('should evaluate postNavigationHooks', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: `${serverAddress}/?q=1` },
-            ],
+            sources: [{ url: `${serverAddress}/?q=1` }],
         });
         let isEvaluated = false;
 
@@ -234,9 +217,7 @@ describe('BrowserCrawler', () => {
 
     test('errorHandler has open page', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: `${serverAddress}/?q=1` },
-            ],
+            sources: [{ url: `${serverAddress}/?q=1` }],
         });
 
         const result: string[] = [];
@@ -262,9 +243,7 @@ describe('BrowserCrawler', () => {
     });
 
     test('should correctly track request.state', async () => {
-        const sources = [
-            { url: `${serverAddress}/?q=1` },
-        ];
+        const sources = [{ url: `${serverAddress}/?q=1` }];
         const requestList = await RequestList.open(null, sources);
         const requestStates: RequestState[] = [];
 
@@ -308,17 +287,18 @@ describe('BrowserCrawler', () => {
 
     test('should allow modifying gotoOptions by pre navigation hooks', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: `${serverAddress}/?q=1` },
-            ],
+            sources: [{ url: `${serverAddress}/?q=1` }],
         });
         let optionsGoto: PuppeteerGoToOptions;
-        const browserCrawler = new class extends BrowserCrawlerTest {
-            protected override _navigationHandler(ctx: PuppeteerCrawlingContext, gotoOptions: PuppeteerGoToOptions): Promise<HTTPResponse | null | undefined> {
+        const browserCrawler = new (class extends BrowserCrawlerTest {
+            protected override async _navigationHandler(
+                ctx: PuppeteerCrawlingContext,
+                gotoOptions: PuppeteerGoToOptions,
+            ): Promise<HTTPResponse | null | undefined> {
                 optionsGoto = gotoOptions;
                 return ctx.page.goto(ctx.request.url, gotoOptions);
             }
-        }({
+        })({
             browserPoolOptions: {
                 browserPlugins: [puppeteerPlugin],
             },
@@ -328,22 +308,20 @@ describe('BrowserCrawler', () => {
             maxRequestRetries: 0,
             preNavigationHooks: [
                 async (_crawlingContext, gotoOptions) => {
-                    gotoOptions.timeout = 60000;
+                    gotoOptions!.timeout = 60000;
                 },
             ],
         });
 
         await browserCrawler.run();
 
-        expect(optionsGoto.timeout).toEqual(60000);
+        expect(optionsGoto!.timeout).toEqual(60000);
     });
 
     test('should ignore errors in Page.close()', async () => {
         for (let i = 0; i < 2; i++) {
             const requestList = await RequestList.open({
-                sources: [
-                    { url: `${serverAddress}/?q=1` },
-                ],
+                sources: [{ url: `${serverAddress}/?q=1` }],
             });
             let failedCalled = false;
 
@@ -352,7 +330,7 @@ describe('BrowserCrawler', () => {
                     browserPlugins: [puppeteerPlugin],
                 },
                 requestList,
-                requestHandler: ({ page }) => {
+                requestHandler: async ({ page }) => {
                     page.close = async () => {
                         if (i === 0) {
                             throw new Error();
@@ -373,12 +351,10 @@ describe('BrowserCrawler', () => {
 
     test('should respect the requestHandlerTimeoutSecs option', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: `${serverAddress}/?q=1` },
-            ],
+            sources: [{ url: `${serverAddress}/?q=1` }],
         });
 
-        const callSpy = jest.fn();
+        const callSpy = vitest.fn();
 
         const browserCrawler = new BrowserCrawlerTest({
             browserPoolOptions: {
@@ -401,9 +377,7 @@ describe('BrowserCrawler', () => {
 
     test('should not throw without SessionPool', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: 'http://example.com/?q=1' },
-            ],
+            sources: [{ url: 'http://example.com/?q=1' }],
         });
         const browserCrawler = new BrowserCrawlerTest({
             browserPoolOptions: {
@@ -412,7 +386,6 @@ describe('BrowserCrawler', () => {
             requestList,
             useSessionPool: false,
             requestHandler: async () => {},
-
         });
 
         expect(browserCrawler).toBeDefined();
@@ -420,9 +393,7 @@ describe('BrowserCrawler', () => {
 
     test('should correctly set session pool options', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: 'http://example.com/?q=1' },
-            ],
+            sources: [{ url: 'http://example.com/?q=1' }],
         });
 
         const crawler = new BrowserCrawlerTest({
@@ -469,12 +440,17 @@ describe('BrowserCrawler', () => {
             useSessionPool: true,
             persistCookiesPerSession: true,
             requestHandler: async ({ session, request }) => {
-                loadedCookies.push(session.getCookieString(request.url));
+                loadedCookies.push(session!.getCookieString(request.url));
                 return Promise.resolve();
             },
             preNavigationHooks: [
                 async ({ session, page }) => {
-                    await page.setCookie({ name: 'TEST', value: '12321312312', domain: 'example.com', expires: Date.now() + 100000 });
+                    await page.setCookie({
+                        name: 'TEST',
+                        value: '12321312312',
+                        domain: 'example.com',
+                        expires: Date.now() + 100000,
+                    });
                     goToPageSessions.push(session);
                 },
             ],
@@ -499,7 +475,7 @@ describe('BrowserCrawler', () => {
 
     test('should throw on "blocked" status codes', async () => {
         const baseUrl = 'https://example.com/';
-        const sources = [401, 403, 429].map((statusCode) => {
+        const sources = BLOCKED_STATUS_CODES.map((statusCode) => {
             return {
                 url: baseUrl + statusCode,
                 userData: { statusCode },
@@ -540,9 +516,77 @@ describe('BrowserCrawler', () => {
         expect(called).toBe(false);
     });
 
+    test('retryOnBlocked should retry on Cloudflare challenge', async () => {
+        const urls = [new URL('/special/cloudflareBlocking', serverAddress).href];
+        const maxSessionRotations = 1;
+
+        let processed = false;
+        const errorMessages: string[] = [];
+
+        const crawler = new BrowserCrawlerTest({
+            browserPoolOptions: {
+                browserPlugins: [puppeteerPlugin],
+            },
+            retryOnBlocked: true,
+            maxSessionRotations,
+            requestHandler: async ({ page, response }) => {
+                processed = true;
+            },
+            failedRequestHandler: async ({ request }) => {
+                errorMessages.push(...request.errorMessages);
+            },
+        });
+
+        await crawler.run(urls);
+
+        expect(errorMessages).toHaveLength(urls.length * (maxSessionRotations + 1));
+        expect(errorMessages.every((x) => x.includes('Detected a session error, rotating session...'))).toBe(true);
+        expect(processed).toBe(false);
+    });
+
+    test('retryOnBlocked throws on "blocked" status codes', async () => {
+        const baseUrl = 'https://example.com/';
+        const sources = BLOCKED_STATUS_CODES.map((statusCode) => {
+            return {
+                url: baseUrl + statusCode,
+                userData: { statusCode },
+            };
+        });
+        const requestList = await RequestList.open(null, sources);
+        const maxSessionRotations = 1;
+        const errorMessages: string[] = [];
+
+        let processed = false;
+        const crawler = new BrowserCrawlerTest({
+            browserPoolOptions: {
+                browserPlugins: [puppeteerPlugin],
+            },
+            requestList,
+            retryOnBlocked: true,
+            maxSessionRotations,
+            requestHandler: async () => {
+                processed = true;
+            },
+            failedRequestHandler: async ({ request }) => {
+                errorMessages.push(...request.errorMessages);
+            },
+        });
+
+        // @ts-expect-error Overriding protected method
+        crawler._navigationHandler = async ({ request }) => {
+            return { status: () => request.userData.statusCode };
+        };
+
+        await crawler.run();
+
+        expect(errorMessages.length).toBe(sources.length * (maxSessionRotations + 1));
+        expect(errorMessages.every((x) => x.includes('Detected a session error, rotating session...'))).toBe(true);
+        expect(processed).toBe(false);
+    });
+
     test('should throw on "blocked" status codes (retire session)', async () => {
         const baseUrl = 'https://example.com/';
-        const sources = [401, 403, 429].map((statusCode) => {
+        const sources = BLOCKED_STATUS_CODES.map((statusCode) => {
             return {
                 url: baseUrl + statusCode,
                 userData: { statusCode },
@@ -585,9 +629,7 @@ describe('BrowserCrawler', () => {
 
     test('should retire browser with session', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: 'http://example.com/?q=1' },
-            ],
+            sources: [{ url: 'http://example.com/?q=1' }],
         });
         let resolve: (value?: unknown) => void;
 
@@ -595,16 +637,18 @@ describe('BrowserCrawler', () => {
             resolve = r;
         });
         let called = false;
-        const browserCrawler = new class extends BrowserCrawlerTest {
-            protected override _navigationHandler(ctx: PuppeteerCrawlingContext): Promise<HTTPResponse | null | undefined> {
+        const browserCrawler = new (class extends BrowserCrawlerTest {
+            protected override async _navigationHandler(
+                ctx: PuppeteerCrawlingContext,
+            ): Promise<HTTPResponse | null | undefined> {
                 ctx.crawler.browserPool.on(BROWSER_POOL_EVENTS.BROWSER_RETIRED, () => {
                     resolve();
                     called = true;
                 });
-                ctx.session.retire();
+                ctx.session!.retire();
                 return ctx.page.goto(ctx.request.url);
             }
-        }({
+        })({
             browserPoolOptions: {
                 browserPlugins: [puppeteerPlugin],
             },
@@ -623,9 +667,7 @@ describe('BrowserCrawler', () => {
 
     test('should allow using fingerprints from browser pool', async () => {
         const requestList = await RequestList.open({
-            sources: [
-                { url: `${serverAddress}/?q=1` },
-            ],
+            sources: [{ url: `${serverAddress}/?q=1` }],
         });
         const browserCrawler = new BrowserCrawlerTest({
             browserPoolOptions: {
@@ -649,7 +691,7 @@ describe('BrowserCrawler', () => {
     });
 
     describe('proxy', () => {
-        let requestList: RequestList;
+        let requestList: RequestList | undefined;
         beforeEach(async () => {
             requestList = await RequestList.open({
                 sources: [
@@ -662,7 +704,7 @@ describe('BrowserCrawler', () => {
         });
 
         afterEach(() => {
-            requestList = null;
+            requestList = undefined;
         });
 
         // TODO move to actor sdk tests before splitting the repos
@@ -763,28 +805,147 @@ describe('BrowserCrawler', () => {
                     retireBrowserAfterPageCount: 1,
                 },
                 requestList,
-                requestHandler: async () => {
-                },
+                requestHandler: async () => {},
                 proxyConfiguration,
                 maxRequestRetries: 0,
                 maxConcurrency: 1,
             });
 
             browserCrawler.browserPool.postLaunchHooks.push((_pageId, browserController) => {
-                browserProxies.push(browserController.launchContext.proxyUrl);
+                browserProxies.push(browserController.launchContext.proxyUrl!);
             });
 
             await browserCrawler.run();
 
             // @ts-expect-error Accessing private property
-            const proxiesToUse = proxyConfiguration.proxyUrls;
+            const proxiesToUse = proxyConfiguration.proxyUrls!;
             for (const proxyUrl of proxiesToUse) {
                 expect(browserProxies.includes(new URL(proxyUrl).href.slice(0, -1))).toBeTruthy();
             }
 
             delete process.env[ENV_VARS.PROXY_PASSWORD];
         });
+
+        test('proxy rotation on error works as expected', async () => {
+            const goodProxyUrl = 'http://good.proxy';
+            const proxyConfiguration = new ProxyConfiguration({
+                proxyUrls: ['http://localhost', 'http://localhost:1234', goodProxyUrl],
+            });
+            const requestHandler = vitest.fn();
+
+            const browserCrawler = new (class extends BrowserCrawlerTest {
+                protected override async _navigationHandler(
+                    ctx: PuppeteerCrawlingContext,
+                ): Promise<HTTPResponse | null | undefined> {
+                    const { session } = ctx;
+                    const proxyInfo = await this.proxyConfiguration!.newProxyInfo(session?.id);
+
+                    if (proxyInfo!.url !== goodProxyUrl) {
+                        throw new Error('ERR_PROXY_CONNECTION_FAILED');
+                    }
+
+                    return null;
+                }
+            })({
+                browserPoolOptions: {
+                    browserPlugins: [puppeteerPlugin],
+                },
+                requestList,
+                maxRequestRetries: 0,
+                maxConcurrency: 1,
+                useSessionPool: true,
+                proxyConfiguration,
+                requestHandler,
+            });
+
+            await expect(browserCrawler.run()).resolves.not.toThrow();
+            expect(requestHandler).toHaveBeenCalledTimes(requestList!.length());
+        });
+
+        test('proxy rotation on error respects maxSessionRotations, calls failedRequestHandler', async () => {
+            const proxyConfiguration = new ProxyConfiguration({
+                proxyUrls: ['http://localhost', 'http://localhost:1234'],
+            });
+            const failedRequestHandler = vitest.fn();
+
+            /**
+             * The first increment is the base case when the proxy is retrieved for the first time.
+             */
+            let numberOfRotations = -requestList!.length();
+            const browserCrawler = new (class extends BrowserCrawlerTest {
+                protected override async _navigationHandler(
+                    ctx: PuppeteerCrawlingContext,
+                ): Promise<HTTPResponse | null | undefined> {
+                    const { session } = ctx;
+                    const proxyInfo = await this.proxyConfiguration!.newProxyInfo(session?.id);
+
+                    numberOfRotations++;
+
+                    if (proxyInfo!.url.includes('localhost')) {
+                        throw new Error('ERR_PROXY_CONNECTION_FAILED');
+                    }
+
+                    return null;
+                }
+            })({
+                browserPoolOptions: {
+                    browserPlugins: [puppeteerPlugin],
+                },
+                requestList,
+                maxSessionRotations: 5,
+                maxConcurrency: 1,
+                proxyConfiguration,
+                requestHandler: async () => {},
+                failedRequestHandler,
+            });
+
+            await browserCrawler.run();
+            expect(failedRequestHandler).toBeCalledTimes(requestList!.length());
+            expect(numberOfRotations).toBe(requestList!.length() * 5);
+        });
+
+        test('proxy rotation logs the original proxy error', async () => {
+            const proxyConfiguration = new ProxyConfiguration({ proxyUrls: ['http://localhost:1234'] });
+
+            const proxyError =
+                'Proxy responded with 400 - Bad request. Also, this error message contains some useful payload.';
+
+            const crawler = new (class extends BrowserCrawlerTest {
+                protected override async _navigationHandler(
+                    ctx: PuppeteerCrawlingContext,
+                ): Promise<HTTPResponse | null | undefined> {
+                    const { session } = ctx;
+                    const proxyInfo = await this.proxyConfiguration!.newProxyInfo(session?.id);
+
+                    if (proxyInfo!.url.includes('localhost')) {
+                        throw new Error(proxyError);
+                    }
+
+                    return null;
+                }
+            })({
+                browserPoolOptions: {
+                    browserPlugins: [puppeteerPlugin],
+                },
+                requestList,
+                maxSessionRotations: 1,
+                maxConcurrency: 1,
+                proxyConfiguration,
+                requestHandler: async () => {},
+            });
+
+            const spy = vitest.spyOn((crawler as any).log, 'warning' as any).mockImplementation(() => {});
+
+            await crawler.run([serverAddress]);
+
+            expect(spy).toBeCalled();
+            expect(spy.mock.calls[0][0]).toEqual(
+                'When using RequestList and RequestQueue at the same time, you should instantiate both explicitly and provide them in the crawler options, to ensure correctly handled restarts of the crawler.',
+            );
+            expect(spy.mock.calls[1][0]).toEqual(expect.stringContaining(proxyError));
+        });
     });
+
     describe('Crawling context', () => {
         const sources = ['http://example.com/'];
         let requestList: RequestList;
@@ -829,7 +990,7 @@ describe('BrowserCrawler', () => {
                 expect(crawlingContext.session).toBeInstanceOf(Session);
                 expect(typeof crawlingContext.page).toBe('object');
                 expect(crawlingContext.crawler).toBeInstanceOf(BrowserCrawlerTest);
-                expect((crawlingContext.crawler).browserPool).toBeInstanceOf(BrowserPool);
+                expect(crawlingContext.crawler.browserPool).toBeInstanceOf(BrowserPool);
                 expect(crawlingContext.hasOwnProperty('response')).toBe(true);
 
                 expect(crawlingContext.error).toBeInstanceOf(Error);
@@ -853,29 +1014,26 @@ describe('BrowserCrawler', () => {
 
             await browserCrawler.run();
         });
+    });
 
-        test('failedRequestHandler contains proxyInfo', async () => {
-            const proxyConfiguration = new ProxyConfiguration({ proxyUrls: ['http://localhost'] });
+    test("enqueueLinks() should skip links that don't match the strategy post redirect", async () => {
+        const succeeded: string[] = [];
 
-            const browserCrawler = new BrowserCrawlerTest({
-                browserPoolOptions: {
-                    browserPlugins: [puppeteerPlugin],
-                },
-                requestList,
-                maxRequestRetries: 0,
-                maxConcurrency: 1,
-                useSessionPool: true,
-                proxyConfiguration,
-                requestHandler: async () => {
-                    throw new Error('some error');
-                },
-                failedRequestHandler: async (crawlingContext) => {
-                    expect(typeof crawlingContext.proxyInfo).toEqual('object');
-                    expect(crawlingContext.proxyInfo.hasOwnProperty('url')).toEqual(true);
-                },
-            });
-
-            await browserCrawler.run();
+        const crawler = new BrowserCrawlerTest({
+            browserPoolOptions: {
+                browserPlugins: [puppeteerPlugin],
+            },
+            maxConcurrency: 1,
+            maxRequestRetries: 0,
+            requestHandler: async ({ page, enqueueLinks }) => {
+                succeeded.push(await page.title());
+                await enqueueLinks({ strategy: EnqueueStrategy.SameOrigin });
+            },
         });
+
+        await crawler.run([`${serverAddress}/special/redirect`]);
+
+        expect(succeeded).toHaveLength(1);
+        expect(succeeded[0]).toEqual('Redirecting outside');
     });
 });

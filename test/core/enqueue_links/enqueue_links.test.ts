@@ -1,7 +1,7 @@
 import log from '@apify/log';
-import type { CheerioRoot } from '@crawlee/utils';
-import cheerio from 'cheerio';
-import type { Request, RequestOptions } from '@crawlee/puppeteer';
+import { type AddRequestsBatchedOptions, cheerioCrawlerEnqueueLinks } from '@crawlee/cheerio';
+import { launchPlaywright } from '@crawlee/playwright';
+import type { RequestQueueOperationOptions, Source } from '@crawlee/puppeteer';
 import {
     browserCrawlerEnqueueLinks,
     Configuration,
@@ -9,8 +9,8 @@ import {
     launchPuppeteer,
     RequestQueue,
 } from '@crawlee/puppeteer';
-import { cheerioCrawlerEnqueueLinks } from '@crawlee/cheerio';
-import { launchPlaywright } from '@crawlee/playwright';
+import type { CheerioRoot } from '@crawlee/utils';
+import { load } from 'cheerio';
 import type { Browser as PlaywrightBrowser, Page as PlaywrightPage } from 'playwright';
 import type { Browser as PuppeteerBrowser, Page as PuppeteerPage } from 'puppeteer';
 
@@ -38,9 +38,23 @@ const HTML = `
         <a href="/x/absolutepath">This is a relative link.</a>
         <a href="y/relativepath">This is a relative link.</a>
         <a href="//example.absolute.com/hello">This is a link to a different subdomain</a>
+        <a href="http://">Invalid URL link, this needs to be ignored</a>
     </body>
 </html>
 `;
+
+function createRequestQueueMock() {
+    const enqueued: Source[] = [];
+    const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
+
+    // @ts-expect-error Override method for testing
+    requestQueue.addRequests = async function (requests) {
+        enqueued.push(...requests);
+        return { processedRequests: requests, unprocessedRequests: [] as never[] };
+    };
+
+    return { enqueued, requestQueue };
+}
 
 describe('enqueueLinks()', () => {
     let ll: number;
@@ -53,34 +67,24 @@ describe('enqueueLinks()', () => {
         log.setLevel(ll);
     });
 
-    describe.each([
-        [launchPuppeteer],
-        [launchPlaywright],
-    ] as const)('using %s', (method) => {
+    describe.each([[launchPuppeteer], [launchPlaywright]] as const)('using %s', (method) => {
         let browser: PuppeteerBrowser | PlaywrightBrowser;
         let page: PuppeteerPage | PlaywrightPage;
 
         beforeEach(async () => {
-            browser = await method({ launchOptions: { headless: true } }) as PlaywrightBrowser | PuppeteerBrowser;
+            browser = (await method({ launchOptions: { headless: true } })) as PlaywrightBrowser | PuppeteerBrowser;
             page = await browser.newPage();
             await page.setContent(HTML);
         });
 
         afterEach(async () => {
             if (browser) await browser.close();
-            page = null;
-            browser = null;
+            page = null!;
+            browser = null!;
         });
 
         test('works with item limit', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
+            const { enqueued, requestQueue } = createRequestQueueMock();
             await browserCrawlerEnqueueLinks({
                 options: { limit: 3, selector: '.click', strategy: EnqueueStrategy.All },
                 page,
@@ -106,17 +110,8 @@ describe('enqueueLinks()', () => {
         });
 
         test('works with globs', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-            const globs = [
-                'https://example.com/**/*',
-                { glob: '?(http|https)://cool.com/', method: 'POST' as const },
-            ];
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            const globs = ['https://example.com/**/*', { glob: '?(http|https)://cool.com/', method: 'POST' as const }];
 
             await browserCrawlerEnqueueLinks({
                 options: {
@@ -150,14 +145,31 @@ describe('enqueueLinks()', () => {
             expect(enqueued[2].userData).toEqual({ label: 'COOL' });
         });
 
-        test('works with regexps', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
+        test('does not throw with empty globs', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            const globs = [
+                'https://example.com/**/*',
+                '',
+                { glob: ' ' },
+                // Empty string used to throw an error (https://console.apify.com/actors/aYG0l9s7dbB7j3gbS/issues/Wd0Ahfk9Vd2OPk4Uf)
+                { glob: '' },
+                { glob: '?(http|https)://cool.com/', method: 'POST' as const },
+            ];
 
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
+            await expect(
+                browserCrawlerEnqueueLinks({
+                    options: { selector: '.click', globs },
+                    page,
+                    requestQueue,
+                    originalRequestUrl: 'https://example.com',
+                }),
+            ).resolves.not.toThrow();
+
+            expect(enqueued).toHaveLength(3);
+        });
+
+        test('works with regexps', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
             const regexps = [
                 /^https:\/\/example\.com\/(\w|\/)+/,
                 { regexp: /^(http|https):\/\/cool\.com\//, method: 'POST' as const, userData: { label: 'COOL' } },
@@ -194,14 +206,104 @@ describe('enqueueLinks()', () => {
             expect(enqueued[2].userData).toEqual({ label: 'COOL' });
         });
 
-        test('works with pseudoUrls', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
+        test('works with skipNavigation', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
 
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
+            await browserCrawlerEnqueueLinks({
+                options: {
+                    selector: '.click',
+                    skipNavigation: true,
+                },
+                page,
+                requestQueue,
+                originalRequestUrl: 'https://example.com',
+            });
+
+            expect(enqueued).toHaveLength(2);
+
+            for (const request of enqueued) {
+                expect(request.skipNavigation).toBe(true);
+            }
+        });
+
+        test('works with exclude glob', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            const globs = ['https://example.com/**/*', { glob: '?(http|https)://cool.com/', method: 'POST' as const }];
+
+            const exclude = ['**/first'];
+
+            await browserCrawlerEnqueueLinks({
+                options: {
+                    selector: '.click',
+                    label: 'COOL',
+                    globs,
+                    exclude,
+                    transformRequestFunction: (request) => {
+                        if (request.url.match(/example\.com\/a\/b\/third/)) {
+                            request.method = 'OPTIONS';
+                        }
+                        return request;
+                    },
+                },
+                page,
+                requestQueue,
+                originalRequestUrl: 'https://example.com',
+            });
+
+            expect(enqueued).toHaveLength(2);
+
+            expect(enqueued[0].url).not.toBe('https://example.com/a/b/first');
+            expect(enqueued[1].url).not.toBe('https://example.com/a/b/first');
+
+            expect(enqueued[0].url).toBe('https://example.com/a/b/third');
+            expect(enqueued[0].method).toBe('OPTIONS');
+            expect(enqueued[0].userData).toEqual({ label: 'COOL' });
+
+            expect(enqueued[1].url).toBe('http://cool.com/');
+            expect(enqueued[1].method).toBe('POST');
+            expect(enqueued[1].userData).toEqual({ label: 'COOL' });
+        });
+
+        test('works with exclude regexp', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            const globs = ['https://example.com/**/*', { glob: '?(http|https)://cool.com/', method: 'POST' as const }];
+
+            const exclude = [/first/];
+
+            await browserCrawlerEnqueueLinks({
+                options: {
+                    selector: '.click',
+                    label: 'COOL',
+                    globs,
+                    exclude,
+                    transformRequestFunction: (request) => {
+                        if (request.url.match(/example\.com\/a\/b\/third/)) {
+                            request.method = 'OPTIONS';
+                        }
+                        return request;
+                    },
+                },
+                page,
+                requestQueue,
+                originalRequestUrl: 'https://example.com',
+            });
+
+            expect(enqueued).toHaveLength(2);
+
+            expect(enqueued[0].url).not.toBe('https://example.com/a/b/first');
+            expect(enqueued[1].url).not.toBe('https://example.com/a/b/first');
+
+            expect(enqueued[0].url).toBe('https://example.com/a/b/third');
+            expect(enqueued[0].method).toBe('OPTIONS');
+            expect(enqueued[0].userData).toEqual({ label: 'COOL' });
+
+            expect(enqueued[1].url).toBe('http://cool.com/');
+            expect(enqueued[1].method).toBe('POST');
+            expect(enqueued[1].userData).toEqual({ label: 'COOL' });
+        });
+
+        test('works with pseudoUrls', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
             const pseudoUrls = [
                 'https://example.com/[(\\w|-|/)*]',
                 { purl: '[http|https]://cool.com/', method: 'POST' as const, userData: { label: 'COOL' } },
@@ -239,36 +341,23 @@ describe('enqueueLinks()', () => {
         });
 
         test('throws with RegExp pseudoUrls', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
+            const { enqueued, requestQueue } = createRequestQueueMock();
 
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (requests) => {
-                enqueued.push(...requests);
-            };
+            const pseudoUrls = [/https:\/\/example\.com\/(\w|-|\/)*/, /(http|https):\/\/cool\.com\//];
 
-            const pseudoUrls = [
-                /https:\/\/example\.com\/(\w|-|\/)*/,
-                /(http|https):\/\/cool\.com\//,
-            ];
-
-            await expect(browserCrawlerEnqueueLinks({
-                // @ts-expect-error Type 'RegExp[]' is not assignable to type 'PseudoUrlInput[]'
-                options: { selector: '.click', pseudoUrls },
-                page,
-                requestQueue,
-                originalRequestUrl: 'https://example.com',
-            })).rejects.toThrow(/to be of type `string` but received type `RegExp`/);
+            await expect(
+                browserCrawlerEnqueueLinks({
+                    // @ts-expect-error Type 'RegExp[]' is not assignable to type 'PseudoUrlInput[]'
+                    options: { selector: '.click', pseudoUrls },
+                    page,
+                    requestQueue,
+                    originalRequestUrl: 'https://example.com',
+                }),
+            ).rejects.toThrow(/to be of type `string` but received type `RegExp`/);
         });
 
         test('works with undefined pseudoUrls[]', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
+            const { enqueued, requestQueue } = createRequestQueueMock();
 
             await browserCrawlerEnqueueLinks({
                 options: { selector: '.click', strategy: EnqueueStrategy.All },
@@ -297,31 +386,20 @@ describe('enqueueLinks()', () => {
         });
 
         test('throws with null pseudoUrls[]', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
-            await expect(browserCrawlerEnqueueLinks({
-                options: { selector: '.click', pseudoUrls: null },
-                page,
-                requestQueue,
-                originalRequestUrl: 'https://example.com',
-            })).rejects.toThrow(/Expected property `pseudoUrls` to be of type `array` but received type `null`/);
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            await expect(
+                browserCrawlerEnqueueLinks({
+                    // @ts-expect-error invalid input
+                    options: { selector: '.click', pseudoUrls: null },
+                    page,
+                    requestQueue,
+                    originalRequestUrl: 'https://example.com',
+                }),
+            ).rejects.toThrow(/Expected property `pseudoUrls` to be of type `array` but received type `null`/);
         });
 
         test('works with empty pseudoUrls[]', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
+            const { enqueued, requestQueue } = createRequestQueueMock();
             await browserCrawlerEnqueueLinks({
                 options: { selector: '.click', pseudoUrls: [], strategy: EnqueueStrategy.All },
                 page,
@@ -349,38 +427,23 @@ describe('enqueueLinks()', () => {
         });
 
         test('throws with sparse pseudoUrls[]', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            const pseudoUrls = ['https://example.com/[(\\w|-|/)*]', null, '[http|https]://cool.com/'];
 
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
-            const pseudoUrls = [
-                'https://example.com/[(\\w|-|/)*]',
-                null,
-                '[http|https]://cool.com/',
-            ];
-
-            await expect(browserCrawlerEnqueueLinks({
-                options: { selector: '.click', pseudoUrls },
-                page,
-                requestQueue,
-                originalRequestUrl: 'https://example.com',
-            })).rejects.toThrow(/\(array `pseudoUrls`\) Any predicate failed with the following errors/);
+            await expect(
+                browserCrawlerEnqueueLinks({
+                    // @ts-expect-error invalid input
+                    options: { selector: '.click', pseudoUrls },
+                    page,
+                    requestQueue,
+                    originalRequestUrl: 'https://example.com',
+                }),
+            ).rejects.toThrow(/\(array `pseudoUrls`\) Any predicate failed with the following errors/);
             expect(enqueued).toHaveLength(0);
         });
 
         test('correctly resolves relative URLs with default strategy of same-hostname', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
+            const { enqueued, requestQueue } = createRequestQueueMock();
             await browserCrawlerEnqueueLinks({
                 options: { baseUrl: 'http://www.absolute.com/removethis/' },
                 page,
@@ -399,15 +462,8 @@ describe('enqueueLinks()', () => {
             expect(enqueued[1].userData).toEqual({});
         });
 
-        test('correctly resolves relative URLs with the strategy of same-hostname', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
+        test('correctly resolves relative URLs with the strategy of same-domain', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
             await browserCrawlerEnqueueLinks({
                 options: { baseUrl: 'http://www.absolute.com/removethis/', strategy: EnqueueStrategy.SameDomain },
                 page,
@@ -431,13 +487,7 @@ describe('enqueueLinks()', () => {
         });
 
         test('correctly resolves relative URLs with the strategy of all', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
+            const { enqueued, requestQueue } = createRequestQueueMock();
             await browserCrawlerEnqueueLinks({
                 options: { baseUrl: 'http://www.absolute.com/removethis/', strategy: EnqueueStrategy.All },
                 page,
@@ -481,18 +531,9 @@ describe('enqueueLinks()', () => {
         });
 
         test('correctly works with transformRequestFunction', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
+            const { enqueued, requestQueue } = createRequestQueueMock();
 
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (requests) => {
-                enqueued.push(...requests);
-            };
-
-            const pseudoUrls = [
-                'https://example.com/[(\\w|-|/)*]',
-                '[http|https]://cool.com/',
-            ];
+            const pseudoUrls = ['https://example.com/[(\\w|-|/)*]', '[http|https]://cool.com/'];
 
             await browserCrawlerEnqueueLinks({
                 options: {
@@ -502,7 +543,7 @@ describe('enqueueLinks()', () => {
                         if (/example\.com/.test(request.url)) {
                             request.method = 'POST';
                         } else if (/cool\.com/.test(request.url)) {
-                            request.userData.foo = 'bar';
+                            request.userData!.foo = 'bar';
                         }
                         return request;
                     },
@@ -524,7 +565,7 @@ describe('enqueueLinks()', () => {
 
             expect(enqueued[2].url).toBe('http://cool.com/');
             expect(enqueued[2].method).toBe('GET');
-            expect(enqueued[2].userData.foo).toBe('bar');
+            expect(enqueued[2].userData!.foo).toBe('bar');
         });
     });
 
@@ -532,21 +573,15 @@ describe('enqueueLinks()', () => {
         let $: CheerioRoot;
 
         beforeEach(async () => {
-            $ = cheerio.load(HTML);
+            $ = load(HTML);
         });
 
         afterEach(async () => {
-            $ = null;
+            $ = null!;
         });
 
         test('works with globs', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
+            const { enqueued, requestQueue } = createRequestQueueMock();
             const globs = [
                 'https://example.com/**/*',
                 { glob: '?(http|https)://cool.com/', method: 'POST' as const, userData: { label: 'COOL' } },
@@ -583,14 +618,29 @@ describe('enqueueLinks()', () => {
             expect(enqueued[2].userData).toEqual({ label: 'COOL' });
         });
 
-        test('works with RegExps', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
+        test('does not throw with empty globs', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            const globs = [
+                'https://example.com/**/*',
+                { glob: '?(http|https)://cool.com/', method: 'POST' as const, userData: { label: 'COOL' } },
+                '',
+                { glob: ' ' },
+            ];
 
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
+            await expect(
+                cheerioCrawlerEnqueueLinks({
+                    options: { selector: '.click', globs },
+                    $,
+                    requestQueue,
+                    originalRequestUrl: 'https://example.com',
+                }),
+            ).resolves.not.toThrow();
+
+            expect(enqueued).toHaveLength(3);
+        });
+
+        test('works with RegExps', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
             const regexps = [
                 /^https:\/\/example\.com\/(\w|\/)+/,
                 { regexp: /^(http|https):\/\/cool\.com\//, method: 'POST' as const, userData: { label: 'COOL' } },
@@ -628,12 +678,7 @@ describe('enqueueLinks()', () => {
         });
 
         test('works with string pseudoUrls', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
+            const { enqueued, requestQueue } = createRequestQueueMock();
             const pseudoUrls = [
                 'https://example.com/[(\\w|-|/)*]',
                 { purl: '[http|https]://cool.com/', method: 'POST' as const, userData: { label: 'COOL' } },
@@ -672,34 +717,22 @@ describe('enqueueLinks()', () => {
         });
 
         test('throws with RegExp pseudoUrls', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-            const pseudoUrls = [
-                /https:\/\/example\.com\/(\w|-|\/)*/,
-                /(http|https):\/\/cool\.com\//,
-            ];
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            const pseudoUrls = [/https:\/\/example\.com\/(\w|-|\/)*/, /(http|https):\/\/cool\.com\//];
 
-            await expect(cheerioCrawlerEnqueueLinks({
-                // @ts-expect-error Type 'RegExp[]' is not assignable to type 'PseudoUrlInput[]'
-                options: { selector: '.click', pseudoUrls },
-                $,
-                requestQueue,
-                originalRequestUrl: 'https://example.com',
-            })).rejects.toThrow(/to be of type `string` but received type `RegExp`/);
+            await expect(
+                cheerioCrawlerEnqueueLinks({
+                    // @ts-expect-error Type 'RegExp[]' is not assignable to type 'PseudoUrlInput[]'
+                    options: { selector: '.click', pseudoUrls },
+                    $,
+                    requestQueue,
+                    originalRequestUrl: 'https://example.com',
+                }),
+            ).rejects.toThrow(/to be of type `string` but received type `RegExp`/);
         });
 
         test('works with undefined pseudoUrls[]', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
+            const { enqueued, requestQueue } = createRequestQueueMock();
             await cheerioCrawlerEnqueueLinks({
                 options: { selector: '.click', strategy: EnqueueStrategy.All },
                 $,
@@ -727,29 +760,20 @@ describe('enqueueLinks()', () => {
         });
 
         test('throws with null pseudoUrls[]', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
-            await expect(cheerioCrawlerEnqueueLinks({
-                options: { selector: '.click', pseudoUrls: null },
-                $,
-                requestQueue,
-                originalRequestUrl: 'https://example.com',
-            })).rejects.toThrow(/Expected property `pseudoUrls` to be of type `array` but received type `null`/);
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            await expect(
+                cheerioCrawlerEnqueueLinks({
+                    // @ts-expect-error invalid input
+                    options: { selector: '.click', pseudoUrls: null },
+                    $,
+                    requestQueue,
+                    originalRequestUrl: 'https://example.com',
+                }),
+            ).rejects.toThrow(/Expected property `pseudoUrls` to be of type `array` but received type `null`/);
         });
 
         test('works with empty pseudoUrls[]', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
+            const { enqueued, requestQueue } = createRequestQueueMock();
             await cheerioCrawlerEnqueueLinks({
                 options: { selector: '.click', pseudoUrls: [], strategy: EnqueueStrategy.All },
                 $,
@@ -777,35 +801,23 @@ describe('enqueueLinks()', () => {
         });
 
         test('throws with sparse pseudoUrls[]', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-            const pseudoUrls = [
-                'https://example.com/[(\\w|-|/)*]',
-                null,
-                '[http|https]://cool.com/',
-            ];
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            const pseudoUrls = ['https://example.com/[(\\w|-|/)*]', null, '[http|https]://cool.com/'];
 
-            await expect(cheerioCrawlerEnqueueLinks({
-                options: { selector: '.click', pseudoUrls },
-                $,
-                requestQueue,
-                originalRequestUrl: 'https://example.com',
-            })).rejects.toThrow(/\(array `pseudoUrls`\) Any predicate failed with the following errors/);
+            await expect(
+                cheerioCrawlerEnqueueLinks({
+                    // @ts-expect-error invalid input
+                    options: { selector: '.click', pseudoUrls },
+                    $,
+                    requestQueue,
+                    originalRequestUrl: 'https://example.com',
+                }),
+            ).rejects.toThrow(/\(array `pseudoUrls`\) Any predicate failed with the following errors/);
             expect(enqueued).toHaveLength(0);
         });
 
         test('correctly resolves relative URLs with the strategy of all', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
+            const { enqueued, requestQueue } = createRequestQueueMock();
             await cheerioCrawlerEnqueueLinks({
                 options: { baseUrl: 'http://www.absolute.com/removethis/', strategy: EnqueueStrategy.All },
                 $,
@@ -849,13 +861,7 @@ describe('enqueueLinks()', () => {
         });
 
         test('correctly resolves relative URLs with the default strategy of same-hostname', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
+            const { enqueued, requestQueue } = createRequestQueueMock();
             await cheerioCrawlerEnqueueLinks({
                 options: { baseUrl: 'http://www.absolute.com/removethis/' },
                 $,
@@ -874,15 +880,8 @@ describe('enqueueLinks()', () => {
             expect(enqueued[1].userData).toEqual({});
         });
 
-        test('correctly resolves relative URLs with the strategy of same-hostname', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
-
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (request) => {
-                enqueued.push(...request);
-            };
-
+        test('correctly resolves relative URLs with the strategy of same-domain', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
             await cheerioCrawlerEnqueueLinks({
                 options: { baseUrl: 'http://www.absolute.com/removethis/', strategy: EnqueueStrategy.SameDomain },
                 $,
@@ -905,18 +904,32 @@ describe('enqueueLinks()', () => {
             expect(enqueued[2].userData).toEqual({});
         });
 
-        test('correctly works with transformRequestFunction', async () => {
-            const enqueued: (Request | RequestOptions)[] = [];
-            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
+        test('correctly resolves relative URLs with `urls` option', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            await cheerioCrawlerEnqueueLinks({
+                options: {
+                    baseUrl: 'http://www.absolute.com/removethis/',
+                    urls: ['/relative/url1', '/relative/url2'],
+                },
+                $,
+                requestQueue,
+                originalRequestUrl: 'https://example.com',
+            });
 
-            // @ts-expect-error Override method for testing
-            requestQueue.addRequests = async (requests) => {
-                enqueued.push(...requests);
-            };
-            const pseudoUrls = [
-                'https://example.com/[(\\w|-|/)*]',
-                '[http|https]://cool.com/',
-            ];
+            expect(enqueued).toHaveLength(2);
+
+            expect(enqueued[0].url).toBe('http://www.absolute.com/relative/url1');
+            expect(enqueued[0].method).toBe('GET');
+            expect(enqueued[0].userData).toEqual({});
+
+            expect(enqueued[1].url).toBe('http://www.absolute.com/relative/url2');
+            expect(enqueued[1].method).toBe('GET');
+            expect(enqueued[1].userData).toEqual({});
+        });
+
+        test('correctly works with transformRequestFunction', async () => {
+            const { enqueued, requestQueue } = createRequestQueueMock();
+            const pseudoUrls = ['https://example.com/[(\\w|-|/)*]', '[http|https]://cool.com/'];
 
             await cheerioCrawlerEnqueueLinks({
                 options: {
@@ -926,7 +939,7 @@ describe('enqueueLinks()', () => {
                         if (/example\.com/.test(request.url)) {
                             request.method = 'POST';
                         } else if (/cool\.com/.test(request.url)) {
-                            request.userData.foo = 'bar';
+                            request.userData!.foo = 'bar';
                         }
                         return request;
                     },
@@ -948,7 +961,61 @@ describe('enqueueLinks()', () => {
 
             expect(enqueued[2].url).toBe('http://cool.com/');
             expect(enqueued[2].method).toBe('GET');
-            expect(enqueued[2].userData.foo).toBe('bar');
+            expect(enqueued[2].userData!.foo).toBe('bar');
+        });
+
+        test('accepts forefront option', async () => {
+            const enqueued: { request: Source; options?: RequestQueueOperationOptions }[] = [];
+            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
+
+            requestQueue.addRequests = async (requests, options) => {
+                // copy the requests to the enqueued list, along with options that were passed to addRequests,
+                // so that it doesn't matter how many calls were made
+                enqueued.push(...requests.map((request) => ({ request, options })));
+                return { processedRequests: [], unprocessedRequests: [] };
+            };
+
+            await cheerioCrawlerEnqueueLinks({
+                options: {
+                    forefront: true,
+                },
+                $,
+                requestQueue,
+                originalRequestUrl: 'https://example.com',
+            });
+
+            expect(enqueued).toHaveLength(5);
+
+            for (let i = 0; i < 5; i++) {
+                expect(enqueued[i].options!.forefront).toBe(true);
+            }
+        });
+
+        test('accepts waitForAllRequestsToBeAdded option', async () => {
+            const enqueued: { request: string | Source; options?: AddRequestsBatchedOptions }[] = [];
+            const requestQueue = new RequestQueue({ id: 'xxx', client: apifyClient });
+
+            requestQueue.addRequestsBatched = async (requests, options) => {
+                // copy the requests to the enqueued list, along with options that were passed to addRequests,
+                // so that it doesn't matter how many calls were made
+                enqueued.push(...requests.map((request) => ({ request, options })));
+                return { addedRequests: [], waitForAllRequestsToBeAdded: Promise.resolve([]) };
+            };
+
+            await cheerioCrawlerEnqueueLinks({
+                options: {
+                    waitForAllRequestsToBeAdded: true,
+                },
+                $,
+                requestQueue,
+                originalRequestUrl: 'https://example.com',
+            });
+
+            expect(enqueued).toHaveLength(5);
+
+            for (let i = 0; i < 5; i++) {
+                expect(enqueued[i].options!.waitForAllRequestsToBeAdded).toBe(true);
+            }
         });
     });
 });

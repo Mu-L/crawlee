@@ -1,6 +1,6 @@
 {
     "name": "@crawlee/types",
-    "version": "3.1.2",
+    "version": "3.12.2",
     "description": "Shared types for the crawlee projects",
     "engines": {
         "node": ">=16.0.0"
@@ -40,10 +40,10 @@
     },
     "homepage": "https://crawlee.dev",
     "scripts": {
-        "build": "npm run clean && npm run compile && npm run copy",
+        "build": "yarn clean && yarn compile && yarn copy",
         "clean": "rimraf ./dist",
         "compile": "tsc -p tsconfig.build.json && gen-esm-wrapper ./dist/index.js ./dist/index.mjs",
-        "copy": "ts-node -T ../../scripts/copy.ts"
+        "copy": "tsx ../../scripts/copy.ts"
     },
     "publishConfig": {
         "access": "public"

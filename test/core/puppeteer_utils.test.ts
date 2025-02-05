@@ -1,12 +1,14 @@
+import type { Server } from 'http';
 import path from 'path';
-import express from 'express';
+
 import log from '@apify/log';
 import { KeyValueStore, launchPuppeteer, puppeteerUtils, Request } from '@crawlee/puppeteer';
 import type { Dictionary } from '@crawlee/utils';
 import type { Browser, Page, ResponseForRequest } from 'puppeteer';
-import type { Server } from 'http';
-import { MemoryStorageEmulator } from 'test/shared/MemoryStorageEmulator';
 import { runExampleComServer } from 'test/shared/_helper';
+import { MemoryStorageEmulator } from 'test/shared/MemoryStorageEmulator';
+
+const launchContext = { launchOptions: { headless: true } };
 
 let port: number;
 let server: Server;
@@ -39,18 +41,18 @@ describe('puppeteerUtils', () => {
         await localStorageEmulator.destroy();
     });
 
-    describe.each([
-        [launchPuppeteer, { launchOptions: { headless: true } }],
-    ] as const)('with %s', (method, launchContext) => {
+    describe('with %s', () => {
         test('injectFile()', async () => {
-            const browser2 = await method(launchContext);
+            const browser2 = await launchPuppeteer(launchContext);
             const survive = async (browser: Browser) => {
                 // Survive navigations
                 const page = await browser.newPage();
                 // @ts-expect-error
                 let result = await page.evaluate(() => window.injectedVariable === 42);
                 expect(result).toBe(false);
-                await puppeteerUtils.injectFile(page, path.join(__dirname, '..', 'shared', 'data', 'inject_file.txt'), { surviveNavigations: true });
+                await puppeteerUtils.injectFile(page, path.join(__dirname, '..', 'shared', 'data', 'inject_file.txt'), {
+                    surviveNavigations: true,
+                });
                 // @ts-expect-error
                 result = await page.evaluate(() => window.injectedVariable);
                 expect(result).toBe(42);
@@ -90,7 +92,7 @@ describe('puppeteerUtils', () => {
         });
 
         test('injectJQuery()', async () => {
-            const browser = await method(launchContext);
+            const browser = await launchPuppeteer(launchContext);
 
             try {
                 const page = await browser.newPage();
@@ -110,7 +112,7 @@ describe('puppeteerUtils', () => {
 
                 await puppeteerUtils.injectJQuery(page);
                 const result2 = await page.evaluate(() => {
-                /* global $ */
+                    /* global $ */
                     return {
                         // @ts-expect-error
                         isDefined: window.jQuery === window.$,
@@ -143,7 +145,7 @@ describe('puppeteerUtils', () => {
         });
 
         test('parseWithCheerio() works', async () => {
-            const browser = await method(launchContext);
+            const browser = await launchPuppeteer(launchContext);
 
             try {
                 const page = await browser.newPage();
@@ -158,10 +160,58 @@ describe('puppeteerUtils', () => {
             }
         });
 
-        describe('blockRequests()', () => {
-            let browser: Browser = null;
+        test('parseWithCheerio() iframe expansion works', async () => {
+            const browser = await launchPuppeteer(launchContext);
+
+            try {
+                const page = await browser.newPage();
+                await page.goto(new URL('/special/outside-iframe', serverAddress).toString());
+
+                const $ = await puppeteerUtils.parseWithCheerio(page);
+
+                const headings = $('h1')
+                    .map((i, el) => $(el).text())
+                    .get();
+                expect(headings).toEqual(['Outside iframe', 'In iframe']);
+            } finally {
+                await browser.close();
+            }
+        });
+
+        describe('parseWithCheerio() shadow root expansion works', () => {
+            let browser: Browser;
             beforeAll(async () => {
-                browser = await method(launchContext);
+                browser = await launchPuppeteer(launchContext);
+            });
+            afterAll(async () => {
+                await browser.close();
+            });
+
+            test('no expansion with ignoreShadowRoots: true', async () => {
+                const page = await browser.newPage();
+                await page.goto(`${serverAddress}/special/shadow-root`);
+                const result = await puppeteerUtils.parseWithCheerio(page, true);
+
+                const text = result('body').text().trim();
+                expect([...text.matchAll(/\[GOOD\]/g)]).toHaveLength(0);
+                expect([...text.matchAll(/\[BAD\]/g)]).toHaveLength(0);
+            });
+
+            test('expansion works', async () => {
+                const page = await browser.newPage();
+                await page.goto(`${serverAddress}/special/shadow-root`);
+                const result = await puppeteerUtils.parseWithCheerio(page);
+
+                const text = result('body').text().trim();
+                expect([...text.matchAll(/\[GOOD\]/g)]).toHaveLength(2);
+                expect([...text.matchAll(/\[BAD\]/g)]).toHaveLength(0);
+            });
+        });
+
+        describe('blockRequests()', () => {
+            let browser: Browser = null as any;
+            beforeAll(async () => {
+                browser = await launchPuppeteer(launchContext);
             });
             afterAll(async () => {
                 await browser.close();
@@ -173,13 +223,8 @@ describe('puppeteerUtils', () => {
                 const page = await browser.newPage();
                 await puppeteerUtils.blockRequests(page);
                 page.on('response', (response) => loadedUrls.push(response.url()));
-                await page.setContent(`<html><body>
-                <link rel="stylesheet" type="text/css" href="${serverAddress}/style.css">
-                <img src="${serverAddress}/image.png">
-                <img src="${serverAddress}/image.gif">
-                <script src="${serverAddress}/script.js" defer="defer">></script>
-            </body></html>`, { waitUntil: 'load' });
-                expect(loadedUrls).toEqual([`${serverAddress}/script.js`]);
+                await page.goto(`${serverAddress}/special/resources`, { waitUntil: 'load' });
+                expect(loadedUrls).toEqual([`${serverAddress}/special/resources`, `${serverAddress}/script.js`]);
             });
 
             test('works with overridden values', async () => {
@@ -190,17 +235,15 @@ describe('puppeteerUtils', () => {
                     urlPatterns: ['.css'],
                 });
                 page.on('response', (response) => loadedUrls.push(response.url()));
-                await page.setContent(`<html><body>
-                <link rel="stylesheet" type="text/css" href="${serverAddress}/style.css">
-                <img src="${serverAddress}/image.png">
-                <img src="${serverAddress}/image.gif">
-                <script src="${serverAddress}/script.js" defer="defer">></script>
-            </body></html>`, { waitUntil: 'load' });
-                expect(loadedUrls).toEqual(expect.arrayContaining([
-                    `${serverAddress}/image.png`,
-                    `${serverAddress}/script.js`,
-                    `${serverAddress}/image.gif`,
-                ]));
+                await page.goto(`${serverAddress}/special/resources`, { waitUntil: 'load' });
+
+                expect(loadedUrls).toEqual(
+                    expect.arrayContaining([
+                        `${serverAddress}/image.png`,
+                        `${serverAddress}/script.js`,
+                        `${serverAddress}/image.gif`,
+                    ]),
+                );
             });
 
             test('blockResources() supports default values', async () => {
@@ -209,15 +252,9 @@ describe('puppeteerUtils', () => {
                 const page = await browser.newPage();
                 await puppeteerUtils.blockResources(page);
                 page.on('response', (response) => loadedUrls.push(response.url()));
-                await page.setContent(`<html><body>
-                <link rel="stylesheet" type="text/css" href="${serverAddress}/style.css">
-                <img src="${serverAddress}/image.png" />
-                <script src="${serverAddress}/script.js" defer="defer">></script>
-            </body></html>`, { waitUntil: 'load' });
+                await page.goto(`${serverAddress}/special/resources`, { waitUntil: 'load' });
 
-                expect(loadedUrls).toEqual(expect.arrayContaining([
-                    `${serverAddress}/script.js`,
-                ]));
+                expect(loadedUrls).toEqual(expect.arrayContaining([`${serverAddress}/script.js`]));
             });
 
             test('blockResources() supports nondefault values', async () => {
@@ -226,27 +263,22 @@ describe('puppeteerUtils', () => {
                 const page = await browser.newPage();
                 await puppeteerUtils.blockResources(page, ['script']);
                 page.on('response', (response) => loadedUrls.push(response.url()));
-                await page.setContent(`<html><body>
-                <link rel="stylesheet" type="text/css" href="${serverAddress}/style.css">
-                <img src="${serverAddress}/image.png" />
-                <script src="${serverAddress}/script.js" defer="defer">></script>
-            </body></html>`, { waitUntil: 'load' });
+                await page.goto(`${serverAddress}/special/resources`, { waitUntil: 'load' });
 
-                expect(loadedUrls).toEqual(expect.arrayContaining([
-                    `${serverAddress}/style.css`,
-                    `${serverAddress}/image.png`,
-                ]));
+                expect(loadedUrls).toEqual(
+                    expect.arrayContaining([`${serverAddress}/style.css`, `${serverAddress}/image.png`]),
+                );
             });
         });
 
         test('supports cacheResponses()', async () => {
-            const browser = await method(launchContext);
+            const browser = await launchPuppeteer(launchContext);
             const cache: Dictionary<Partial<ResponseForRequest>> = {};
 
             const getResourcesLoadedFromWiki = async () => {
                 let downloadedBytes = 0;
                 const page = await browser.newPage();
-                await page.setDefaultNavigationTimeout(0);
+                page.setDefaultNavigationTimeout(0);
                 // Cache all javascript files, png files and svg files
                 await puppeteerUtils.cacheResponses(page, cache, ['.js', /.+\.png/i, /.+\.svg/i]);
                 page.on('response', async (response) => {
@@ -255,7 +287,7 @@ describe('puppeteerUtils', () => {
                         const buffer = await response.buffer();
                         downloadedBytes += buffer.byteLength;
                     } catch (e) {
-                    // do nothing
+                        // do nothing
                     }
                 });
                 await page.goto(`${serverAddress}/cacheable`, { waitUntil: 'networkidle0', timeout: 60e3 });
@@ -293,6 +325,7 @@ describe('puppeteerUtils', () => {
             await testRuleType(0);
             // @ts-expect-error
             await testRuleType(1);
+            // @ts-expect-error
             await testRuleType(null);
             // @ts-expect-error
             await testRuleType([]);
@@ -318,7 +351,7 @@ describe('puppeteerUtils', () => {
                 // TODO figure out why the err.message comes out empty in the logs.
                 expect((err as Error).message).toMatch(/Unexpected token '?const'?/);
             }
-            const browser = await method(launchContext);
+            const browser = await launchPuppeteer(launchContext);
             try {
                 const page = await browser.newPage();
                 const content = await script({ page } as any);
@@ -330,7 +363,7 @@ describe('puppeteerUtils', () => {
         });
 
         test('gotoExtended() works', async () => {
-            const browser = await method(launchContext);
+            const browser = await launchPuppeteer(launchContext);
 
             try {
                 const page = await browser.newPage();
@@ -343,10 +376,9 @@ describe('puppeteerUtils', () => {
                     payload: '{ "foo": "bar" }',
                 });
 
-                const response = await puppeteerUtils.gotoExtended(page, request);
+                const response = await puppeteerUtils.gotoExtended(page, request, { waitUntil: 'networkidle' });
 
-                // eslint-disable-next-line @typescript-eslint/no-shadow
-                const { method, headers, bodyLength } = JSON.parse(await response.text());
+                const { method, headers, bodyLength } = JSON.parse(await response!.text());
                 expect(method).toBe('POST');
                 expect(bodyLength).toBe(16);
                 expect(headers['content-type']).toBe('application/json; charset=utf-8');
@@ -357,7 +389,7 @@ describe('puppeteerUtils', () => {
 
         describe('infiniteScroll()', () => {
             function isAtBottom() {
-                return (window.innerHeight + window.pageYOffset) >= document.body.offsetHeight;
+                return window.innerHeight + window.pageYOffset >= document.body.offsetHeight;
             }
 
             let browser: Browser;
@@ -372,9 +404,11 @@ describe('puppeteerUtils', () => {
             beforeEach(async () => {
                 page = await browser.newPage();
                 let count = 0;
-                const content = Array(1000).fill(null).map(() => {
-                    return `<div style="border: 1px solid black">Div number: ${count++}</div>`;
-                });
+                const content = Array(1000)
+                    .fill(null)
+                    .map(() => {
+                        return `<div style="border: 1px solid black">Div number: ${count++}</div>`;
+                    });
                 const contentHTML = `<html><body>${content}</body></html>`;
                 await page.setContent(contentHTML);
             });
@@ -392,6 +426,23 @@ describe('puppeteerUtils', () => {
                 expect(after).toBe(true);
             });
 
+            test('maxScrollHeight works', async () => {
+                const before = await page.evaluate(isAtBottom);
+                expect(before).toBe(false);
+
+                await puppeteerUtils.infiniteScroll(page, {
+                    waitForSecs: Infinity,
+                    maxScrollHeight: 1000,
+                    stopScrollCallback: async () => true,
+                });
+
+                const after = await page.evaluate(isAtBottom);
+                // It scrolls to the bottom in the first scroll so this is correct.
+                // The test passes because the Infinite waitForSecs is broken by the height requirement.
+                // If it didn't, the test would time out.
+                expect(after).toBe(true);
+            });
+
             test('stopScrollCallback works', async () => {
                 const before = await page.evaluate(isAtBottom);
                 expect(before).toBe(false);
@@ -402,28 +453,30 @@ describe('puppeteerUtils', () => {
                 });
 
                 const after = await page.evaluate(isAtBottom);
-                // It scrolls to the bottom in the first scroll so this is correct.
-                // The test passes because the Infinite waitForSecs is broken by the callback.
-                // If it didn't, the test would time out.
                 expect(after).toBe(true);
             });
         });
 
         it('saveSnapshot() works', async () => {
-            const openKVSSpy = jest.spyOn(KeyValueStore, 'open');
-            const browser = await method(launchContext);
+            const openKVSSpy = vitest.spyOn(KeyValueStore, 'open');
+            const browser = await launchPuppeteer(launchContext);
 
             try {
                 const page = await browser.newPage();
-                const contentHTML = '<html><head></head><body><div style="border: 1px solid black">Div number: 1</div></body></html>';
+                const contentHTML =
+                    '<html><head></head><body><div style="border: 1px solid black">Div number: 1</div></body></html>';
                 await page.setContent(contentHTML);
 
                 const screenshot = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 60 });
 
                 // Test saving both image and html
-                const object = { setValue: jest.fn() };
+                const object = { setValue: vitest.fn() };
                 openKVSSpy.mockResolvedValue(object as any);
-                await puppeteerUtils.saveSnapshot(page, { key: 'TEST', keyValueStoreName: 'TEST-STORE', screenshotQuality: 60 });
+                await puppeteerUtils.saveSnapshot(page, {
+                    key: 'TEST',
+                    keyValueStoreName: 'TEST-STORE',
+                    screenshotQuality: 60,
+                });
 
                 expect(object.setValue).toBeCalledWith('TEST.jpg', screenshot, { contentType: 'image/jpeg' });
                 expect(object.setValue).toBeCalledWith('TEST.html', contentHTML, { contentType: 'text/html' });
@@ -436,7 +489,6 @@ describe('puppeteerUtils', () => {
                 const screenshot2 = await page.screenshot({ fullPage: true, type: 'jpeg', quality: 50 });
                 expect(object.setValue).toBeCalledWith('SNAPSHOT.jpg', screenshot2, { contentType: 'image/jpeg' });
             } finally {
-                openKVSSpy.mockRestore();
                 await browser.close();
             }
         });

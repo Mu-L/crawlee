@@ -1,6 +1,8 @@
 import { readdir, rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
+
 import { MemoryStorage } from '@crawlee/memory-storage';
+
 import { waitTillWrittenToDisk } from './__shared__';
 
 describe('persistStorage option', () => {
@@ -24,7 +26,7 @@ describe('persistStorage option', () => {
             await keyValueStore.setRecord({ key: 'foo', value: 'test' });
 
             // We check that reading the directory for the store throws an error, which means it wasn't created on disk
-            await expect(() => readdir(localDataDirectory)).rejects.toThrow();
+            await expect(async () => readdir(localDataDirectory)).rejects.toThrow();
         });
     });
 
@@ -49,9 +51,7 @@ describe('persistStorage option', () => {
             const directoryFiles = await readdir(storePath);
 
             expect(directoryFiles).toHaveLength(1);
-            expect(directoryFiles).toEqual([
-                '__metadata__.json',
-            ]);
+            expect(directoryFiles).toEqual(['__metadata__.json']);
         });
     });
 });

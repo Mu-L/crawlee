@@ -1,13 +1,11 @@
 {
     "name": "crawlee",
-    "version": "3.1.4",
+    "version": "3.12.2",
     "description": "The scalable web crawling and scraping library for JavaScript/Node.js. Enables development of data extraction and web automation jobs (not only) with headless Chrome and Puppeteer.",
     "engines": {
         "node": ">=16.0.0"
     },
-    "bin": {
-        "crawlee": "./src/cli.ts"
-    },
+    "bin": "./src/cli.ts",
     "main": "./dist/index.js",
     "module": "./dist/index.mjs",
     "types": "./dist/index.d.ts",
@@ -47,30 +45,33 @@
     },
     "homepage": "https://crawlee.dev",
     "scripts": {
-        "build": "npm run clean && npm run compile && npm run copy",
+        "build": "yarn clean && yarn compile && yarn copy",
         "clean": "rimraf ./dist",
         "compile": "tsc -p tsconfig.build.json && gen-esm-wrapper ./dist/index.js ./dist/index.mjs",
-        "copy": "ts-node -T ../../scripts/copy.ts"
+        "copy": "tsx ../../scripts/copy.ts"
     },
     "publishConfig": {
         "access": "public"
     },
     "dependencies": {
-        "@crawlee/basic": "^3.1.4",
-        "@crawlee/browser": "^3.1.4",
-        "@crawlee/cheerio": "^3.1.4",
-        "@crawlee/cli": "^3.1.2",
-        "@crawlee/core": "^3.1.3",
-        "@crawlee/http": "^3.1.4",
-        "@crawlee/jsdom": "^3.1.4",
-        "@crawlee/playwright": "^3.1.4",
-        "@crawlee/puppeteer": "^3.1.4",
-        "@crawlee/utils": "^3.1.2",
-        "import-local": "^3.1.0"
+        "@crawlee/basic": "3.12.2",
+        "@crawlee/browser": "3.12.2",
+        "@crawlee/browser-pool": "3.12.2",
+        "@crawlee/cheerio": "3.12.2",
+        "@crawlee/cli": "3.12.2",
+        "@crawlee/core": "3.12.2",
+        "@crawlee/http": "3.12.2",
+        "@crawlee/jsdom": "3.12.2",
+        "@crawlee/linkedom": "3.12.2",
+        "@crawlee/playwright": "3.12.2",
+        "@crawlee/puppeteer": "3.12.2",
+        "@crawlee/utils": "3.12.2",
+        "import-local": "^3.1.0",
+        "tslib": "^2.4.0"
     },
     "peerDependencies": {
-        "playwright": ">= 1.21.x <= 1.27.x",
-        "puppeteer": "<= 19.x"
+        "playwright": "*",
+        "puppeteer": "*"
     },
     "peerDependenciesMeta": {
         "playwright": {

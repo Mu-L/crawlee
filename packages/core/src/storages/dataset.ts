@@ -1,14 +1,16 @@
 import { MAX_PAYLOAD_SIZE_BYTES } from '@apify/consts';
-import ow from 'ow';
-import { stringify } from 'csv-stringify/sync';
 import type { DatasetClient, DatasetInfo, Dictionary, StorageClient } from '@crawlee/types';
-import { Configuration } from '../configuration';
-import { log } from '../log';
-import type { Awaitable } from '../typedefs';
+import { stringify } from 'csv-stringify/sync';
+import ow from 'ow';
+
+import { checkStorageAccess } from './access_checking';
+import { KeyValueStore } from './key_value_store';
 import type { StorageManagerOptions } from './storage_manager';
 import { StorageManager } from './storage_manager';
 import { purgeDefaultStorages } from './utils';
-import { KeyValueStore } from './key_value_store';
+import { Configuration } from '../configuration';
+import { log, type Log } from '../log';
+import type { Awaitable } from '../typedefs';
 
 /** @internal */
 export const DATASET_ITERATORS_DEFAULT_LIMIT = 10000;
@@ -65,7 +67,7 @@ export function chunkBySize(items: string[], limitBytes: number): string[] {
     for (const payload of items) {
         const bytes = Buffer.byteLength(payload);
 
-        if (bytes <= limitBytes && (bytes + 2) > limitBytes) {
+        if (bytes <= limitBytes && bytes + 2 > limitBytes) {
             // Handle cases where wrapping with [] would fail, but solo object is fine.
             chunks.push(payload);
             lastChunkBytes = bytes;
@@ -138,7 +140,10 @@ export interface DatasetDataOptions {
     skipEmpty?: boolean;
 }
 
-export interface DatasetIteratorOptions extends Omit<DatasetDataOptions, 'offset' | 'limit' | 'clean' | 'skipHidden' | 'skipEmpty'> {
+export interface DatasetExportOptions extends Omit<DatasetDataOptions, 'offset' | 'limit'> {}
+
+export interface DatasetIteratorOptions
+    extends Omit<DatasetDataOptions, 'offset' | 'limit' | 'clean' | 'skipHidden' | 'skipEmpty'> {
     /** @internal */
     offset?: number;
 
@@ -161,7 +166,7 @@ export interface DatasetIteratorOptions extends Omit<DatasetDataOptions, 'offset
     format?: string;
 }
 
-export interface ExportOptions {
+export interface DatasetExportToOptions extends DatasetExportOptions {
     fromDataset?: string;
     toKVS?: string;
 }
@@ -221,12 +226,15 @@ export class Dataset<Data extends Dictionary = Dictionary> {
     id: string;
     name?: string;
     client: DatasetClient<Data>;
-    log = log.child({ prefix: 'Dataset' });
+    log: Log = log.child({ prefix: 'Dataset' });
 
     /**
      * @internal
      */
-    constructor(options: DatasetOptions, readonly config = Configuration.getGlobalConfig()) {
+    constructor(
+        options: DatasetOptions,
+        readonly config = Configuration.getGlobalConfig(),
+    ) {
         this.id = options.id;
         this.name = options.name;
         this.client = options.client.dataset(this.id) as DatasetClient<Data>;
@@ -257,8 +265,10 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      *   The objects must be serializable to JSON and the JSON representation of each object must be smaller than 9MB.
      */
     async pushData(data: Data | Data[]): Promise<void> {
+        checkStorageAccess();
+
         ow(data, 'data', ow.object);
-        const dispatch = (payload: string) => this.client.pushItems(payload);
+        const dispatch = async (payload: string) => this.client.pushItems(payload);
         const limit = MAX_PAYLOAD_SIZE_BYTES - Math.ceil(MAX_PAYLOAD_SIZE_BYTES * SAFETY_BUFFER_PERCENT);
 
         // Handle singular Objects
@@ -281,31 +291,33 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      * Returns {@apilink DatasetContent} object holding the items in the dataset based on the provided parameters.
      */
     async getData(options: DatasetDataOptions = {}): Promise<DatasetContent<Data>> {
+        checkStorageAccess();
+
         try {
             return await this.client.listItems(options);
         } catch (e) {
             const error = e as Error;
             if (error.message.includes('Cannot create a string longer than')) {
-                throw new Error('dataset.getData(): The response is too large for parsing. You can fix this by lowering the "limit" option.');
+                throw new Error(
+                    'dataset.getData(): The response is too large for parsing. You can fix this by lowering the "limit" option.',
+                );
             }
             throw e;
         }
     }
 
     /**
-     * Save the entirety of the dataset's contents into one file within a key-value store.
-     *
-     * @param key The name of the value to save the data in.
-     * @param [options] An optional options object where you can provide the dataset and target KVS name.
-     * @param [contentType] Only JSON and CSV are supported currently, defaults to JSON.
+     * Returns all the data from the dataset. This will iterate through the whole dataset
+     * via the `listItems()` client method, which gives you only paginated results.
      */
-    async exportTo(key: string, options?: ExportOptions, contentType?: string): Promise<void> {
-        const kvStore = await KeyValueStore.open(options?.toKVS ?? null);
+    async export(options: DatasetExportOptions = {}): Promise<Data[]> {
+        checkStorageAccess();
+
         const items: Data[] = [];
 
         const fetchNextChunk = async (offset = 0): Promise<void> => {
             const limit = 1000;
-            const value = await this.client.listItems({ offset, limit });
+            const value = await this.client.listItems({ offset, limit, ...options });
 
             if (value.count === 0) {
                 return;
@@ -320,19 +332,40 @@ export class Dataset<Data extends Dictionary = Dictionary> {
 
         await fetchNextChunk();
 
+        return items;
+    }
+
+    /**
+     * Save the entirety of the dataset's contents into one file within a key-value store.
+     *
+     * @param key The name of the value to save the data in.
+     * @param [options] An optional options object where you can provide the dataset and target KVS name.
+     * @param [contentType] Only JSON and CSV are supported currently, defaults to JSON.
+     */
+    async exportTo(key: string, options?: DatasetExportToOptions, contentType?: string): Promise<Data[]> {
+        const kvStore = await KeyValueStore.open(options?.toKVS ?? null, { config: this.config });
+        const items = await this.export(options);
+
         if (contentType === 'text/csv') {
+            const keys = Object.keys(items[0]);
             const value = stringify([
-                Object.keys(items[0]),
-                ...items.map((item) => Object.values(item)),
+                keys,
+                ...items.map((item) => {
+                    return keys.map((k) => item[k]);
+                }),
             ]);
-            return kvStore.setValue(key, value, { contentType });
+            await kvStore.setValue(key, value, { contentType });
+            return items;
         }
 
         if (contentType === 'application/json') {
-            return kvStore.setValue(key, items);
+            await kvStore.setValue(key, items);
+            return items;
         }
 
         throw new Error(`Unsupported content type: ${contentType}`);
+
+        return items;
     }
 
     /**
@@ -341,7 +374,7 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      * @param key The name of the value to save the data in.
      * @param [options] An optional options object where you can provide the target KVS name.
      */
-    async exportToJSON(key: string, options?: Omit<ExportOptions, 'fromDataset'>) {
+    async exportToJSON(key: string, options?: Omit<DatasetExportToOptions, 'fromDataset'>) {
         await this.exportTo(key, options, 'application/json');
     }
 
@@ -351,7 +384,7 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      * @param key The name of the value to save the data in.
      * @param [options] An optional options object where you can provide the target KVS name.
      */
-    async exportToCSV(key: string, options?: Omit<ExportOptions, 'fromDataset'>) {
+    async exportToCSV(key: string, options?: Omit<DatasetExportToOptions, 'fromDataset'>) {
         await this.exportTo(key, options, 'text/csv');
     }
 
@@ -361,7 +394,9 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      * @param key The name of the value to save the data in.
      * @param [options] An optional options object where you can provide the dataset and target KVS name.
      */
-    static async exportToJSON(key: string, options?: ExportOptions) {
+    static async exportToJSON(key: string, options?: DatasetExportToOptions) {
+        checkStorageAccess();
+
         const dataset = await this.open(options?.fromDataset);
         await dataset.exportToJSON(key, options);
     }
@@ -372,7 +407,9 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      * @param key The name of the value to save the data in.
      * @param [options] An optional options object where you can provide the dataset and target KVS name.
      */
-    static async exportToCSV(key: string, options?: ExportOptions) {
+    static async exportToCSV(key: string, options?: DatasetExportToOptions) {
+        checkStorageAccess();
+
         const dataset = await this.open(options?.fromDataset);
         await dataset.exportToCSV(key, options);
     }
@@ -400,6 +437,8 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      * ```
      */
     async getInfo(): Promise<DatasetInfo | undefined> {
+        checkStorageAccess();
+
         return this.client.get();
     }
 
@@ -424,8 +463,11 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      * @default 0
      */
     async forEach(iteratee: DatasetConsumer<Data>, options: DatasetIteratorOptions = {}, index = 0): Promise<void> {
+        checkStorageAccess();
+
         if (!options.offset) options.offset = 0;
-        if (options.format && options.format !== 'json') throw new Error('Dataset.forEach/map/reduce() support only a "json" format.');
+        if (options.format && options.format !== 'json')
+            throw new Error('Dataset.forEach/map/reduce() support only a "json" format.');
         if (!options.limit) options.limit = DATASET_ITERATORS_DEFAULT_LIMIT;
 
         const { items, total, limit, offset } = await this.getData(options);
@@ -451,6 +493,8 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      * @param [options] All `map()` parameters.
      */
     async map<R>(iteratee: DatasetMapper<Data, R>, options: DatasetIteratorOptions = {}): Promise<R[]> {
+        checkStorageAccess();
+
         const result: R[] = [];
 
         await this.forEach(async (item, index) => {
@@ -464,32 +508,79 @@ export class Dataset<Data extends Dictionary = Dictionary> {
     /**
      * Reduces a list of values down to a single value.
      *
-     * Memo is the initial state of the reduction, and each successive step of it should be returned by `iteratee()`.
-     * The `iteratee()` is passed three arguments: the `memo`, then the `value` and `index` of the iteration.
+     * The first element of the dataset is the initial value, with each successive reductions should
+     * be returned by `iteratee()`. The `iteratee()` is passed three arguments: the `memo`, `value`
+     * and `index` of the current element being folded into the reduction.
      *
-     * If no `memo` is passed to the initial invocation of reduce, the `iteratee()` is not invoked on the first element of the list.
-     * The first element is instead passed as the memo in the invocation of the `iteratee()` on the next element in the list.
+     * The `iteratee` is first invoked on the second element of the list (`index = 1`), with the
+     * first element given as the memo parameter. After that, the rest of the elements in the
+     * dataset is passed to `iteratee`, with the result of the previous invocation as the memo.
+     *
+     * If `iteratee()` returns a `Promise` it's awaited before a next call.
+     *
+     * If the dataset is empty, reduce will return undefined.
+     *
+     * @param iteratee
+     */
+    async reduce(iteratee: DatasetReducer<Data, Data>): Promise<Data | undefined>;
+
+    /**
+     * Reduces a list of values down to a single value.
+     *
+     * The first element of the dataset is the initial value, with each successive reductions should
+     * be returned by `iteratee()`. The `iteratee()` is passed three arguments: the `memo`, `value`
+     * and `index` of the current element being folded into the reduction.
+     *
+     * The `iteratee` is first invoked on the second element of the list (`index = 1`), with the
+     * first element given as the memo parameter. After that, the rest of the elements in the
+     * dataset is passed to `iteratee`, with the result of the previous invocation as the memo.
+     *
+     * If `iteratee()` returns a `Promise` it's awaited before a next call.
+     *
+     * If the dataset is empty, reduce will return undefined.
+     *
+     * @param iteratee
+     * @param memo Unset parameter, neccesary to be able to pass options
+     * @param [options] An object containing extra options for `reduce()`
+     */
+    async reduce(
+        iteratee: DatasetReducer<Data, Data>,
+        memo: undefined,
+        options: DatasetIteratorOptions,
+    ): Promise<Data | undefined>;
+
+    /**
+     * Reduces a list of values down to a single value.
+     *
+     * Memo is the initial state of the reduction, and each successive step of it should be returned
+     * by `iteratee()`. The `iteratee()` is passed three arguments: the `memo`, then the `value` and
+     * `index` of the iteration.
      *
      * If `iteratee()` returns a `Promise` then it's awaited before a next call.
      *
      * @param iteratee
      * @param memo Initial state of the reduction.
-     * @param [options] All `reduce()` parameters.
+     * @param [options] An object containing extra options for `reduce()`
      */
-    async reduce<T>(iteratee: DatasetReducer<T, Data>, memo: T, options: DatasetIteratorOptions = {}): Promise<T> {
-        let currentMemo: T = memo;
+    async reduce<T>(iteratee: DatasetReducer<T, Data>, memo: T, options?: DatasetIteratorOptions): Promise<T>;
 
-        const wrappedFunc: DatasetConsumer<Data> = (item, index) => {
-            return Promise
-                .resolve()
-                .then(() => {
-                    return !index && currentMemo === undefined
-                        ? item
-                        : iteratee(currentMemo, item, index);
-                })
-                .then((newMemo) => {
-                    currentMemo = newMemo as T;
-                });
+    async reduce<T = Data>(
+        iteratee: DatasetReducer<T, Data>,
+        memo?: T,
+        options: DatasetIteratorOptions = {},
+    ): Promise<T | undefined> {
+        checkStorageAccess();
+
+        let currentMemo: T | undefined = memo;
+
+        const wrappedFunc: DatasetConsumer<Data> = async (item, index) => {
+            if (index === 0 && currentMemo === undefined) {
+                currentMemo = item;
+            } else {
+                // We are guaranteed that currentMemo is instanciated, since we are either not on
+                // the first iteration, or memo was already set by the user.
+                currentMemo = await iteratee(currentMemo as T, item, index);
+            }
         };
 
         await this.forEach(wrappedFunc, options);
@@ -501,6 +592,8 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      * depending on the mode of operation.
      */
     async drop(): Promise<void> {
+        checkStorageAccess();
+
         await this.client.delete();
         const manager = StorageManager.getManager(Dataset, this.config);
         manager.closeStorage(this);
@@ -520,16 +613,29 @@ export class Dataset<Data extends Dictionary = Dictionary> {
      *   the function returns the default dataset associated with the crawler run.
      * @param [options] Storage manager options.
      */
-    static async open<Data extends Dictionary = Dictionary>(datasetIdOrName?: string | null, options: StorageManagerOptions = {}): Promise<Dataset<Data>> {
+    static async open<Data extends Dictionary = Dictionary>(
+        datasetIdOrName?: string | null,
+        options: StorageManagerOptions = {},
+    ): Promise<Dataset<Data>> {
+        checkStorageAccess();
+
         ow(datasetIdOrName, ow.optional.string);
-        ow(options, ow.object.exactShape({
-            config: ow.optional.object.instanceOf(Configuration),
-        }));
+        ow(
+            options,
+            ow.object.exactShape({
+                config: ow.optional.object.instanceOf(Configuration),
+                storageClient: ow.optional.object,
+            }),
+        );
+
         options.config ??= Configuration.getGlobalConfig();
-        await purgeDefaultStorages();
+        options.storageClient ??= options.config.getStorageClient();
+
+        await purgeDefaultStorages({ onlyPurgeOnce: true, client: options.storageClient, config: options.config });
+
         const manager = StorageManager.getManager<Dataset<Data>>(this, options.config);
 
-        return manager.openStorage(datasetIdOrName, options.config.getStorageClient());
+        return manager.openStorage(datasetIdOrName, options.storageClient);
     }
 
     /**
@@ -564,7 +670,9 @@ export class Dataset<Data extends Dictionary = Dictionary> {
     /**
      * Returns {@apilink DatasetContent} object holding the items in the dataset based on the provided parameters.
      */
-    static async getData<Data extends Dictionary = Dictionary>(options: DatasetDataOptions = {}): Promise<DatasetContent<Data>> {
+    static async getData<Data extends Dictionary = Dictionary>(
+        options: DatasetDataOptions = {},
+    ): Promise<DatasetContent<Data>> {
         const dataset = await this.open();
         return dataset.getData(options);
     }
@@ -574,41 +682,35 @@ export class Dataset<Data extends Dictionary = Dictionary> {
  * User-function used in the `Dataset.forEach()` API.
  */
 export interface DatasetConsumer<Data> {
-
     /**
      * @param item Current {@apilink Dataset} entry being processed.
      * @param index Position of current {@apilink Dataset} entry.
      */
     (item: Data, index: number): Awaitable<void>;
-
 }
 
 /**
  * User-function used in the `Dataset.map()` API.
  */
 export interface DatasetMapper<Data, R> {
-
     /**
      * User-function used in the `Dataset.map()` API.
      * @param item Current {@apilink Dataset} entry being processed.
      * @param index Position of current {@apilink Dataset} entry.
      */
     (item: Data, index: number): Awaitable<R>;
-
 }
 
 /**
  * User-function used in the `Dataset.reduce()` API.
  */
 export interface DatasetReducer<T, Data> {
-
     /**
      * @param memo Previous state of the reduction.
      * @param item Current {@apilink Dataset} entry being processed.
      * @param index Position of current {@apilink Dataset} entry.
      */
     (memo: T, item: Data, index: number): Awaitable<T>;
-
 }
 
 export interface DatasetOptions {

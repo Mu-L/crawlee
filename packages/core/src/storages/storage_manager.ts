@@ -1,5 +1,8 @@
 import type { Dictionary, StorageClient } from '@crawlee/types';
+import { AsyncQueue } from '@sapphire/async-queue';
+
 import { Configuration } from '../configuration';
+import type { ProxyConfiguration } from '../proxy_configuration';
 import type { Constructor } from '../typedefs';
 
 const DEFAULT_ID_CONFIG_KEYS = {
@@ -18,10 +21,10 @@ export interface IStorage {
  * @ignore
  */
 export class StorageManager<T extends IStorage = IStorage> {
-    private static readonly storageManagers = new Map<Constructor, StorageManager>();
     private readonly name: 'Dataset' | 'KeyValueStore' | 'RequestQueue';
     private readonly StorageConstructor: Constructor<T> & { name: string };
     private readonly cache = new Map<string, T>();
+    private readonly storageOpenQueue = new AsyncQueue();
 
     constructor(
         StorageConstructor: Constructor<T>,
@@ -31,7 +34,7 @@ export class StorageManager<T extends IStorage = IStorage> {
         this.name = this.StorageConstructor.name as 'Dataset' | 'KeyValueStore' | 'RequestQueue';
     }
 
-    static openStorage<T extends IStorage>(
+    static async openStorage<T extends IStorage>(
         storageClass: Constructor<T>,
         idOrName?: string,
         client?: StorageClient,
@@ -44,27 +47,29 @@ export class StorageManager<T extends IStorage = IStorage> {
         storageClass: Constructor<T>,
         config = Configuration.getGlobalConfig(),
     ): StorageManager<T> {
-        if (!this.storageManagers.has(storageClass)) {
+        if (!config.storageManagers.has(storageClass)) {
             const manager = new StorageManager(storageClass, config);
-            this.storageManagers.set(storageClass, manager);
+            config.storageManagers.set(storageClass, manager);
         }
 
-        return this.storageManagers.get(storageClass) as StorageManager<T>;
+        return config.storageManagers.get(storageClass) as StorageManager<T>;
     }
 
     /** @internal */
-    static clearCache(): void {
-        this.storageManagers.forEach((manager) => {
+    static clearCache(config = Configuration.getGlobalConfig()): void {
+        config.storageManagers.forEach((manager) => {
             if (manager.name === 'KeyValueStore') {
                 manager.cache.forEach((item) => {
                     (item as Dictionary).clearCache?.();
                 });
             }
         });
-        this.storageManagers.clear();
+        config.storageManagers.clear();
     }
 
     async openStorage(idOrName?: string | null, client?: StorageClient): Promise<T> {
+        await this.storageOpenQueue.wait();
+
         if (!idOrName) {
             const defaultIdConfigKey = DEFAULT_ID_CONFIG_KEYS[this.name];
             idOrName = this.config.get(defaultIdConfigKey) as string;
@@ -81,8 +86,11 @@ export class StorageManager<T extends IStorage = IStorage> {
                 name: storageObject.name,
                 client,
             });
+
             this._addStorageToCache(storage);
         }
+
+        this.storageOpenQueue.shift();
 
         return storage;
     }
@@ -100,11 +108,15 @@ export class StorageManager<T extends IStorage = IStorage> {
     /**
      * Helper function that first requests storage by ID and if storage doesn't exist then gets it by name.
      */
-    protected async _getOrCreateStorage(storageIdOrName: string, storageConstructorName: string, apiClient: StorageClient) {
-        const {
-            createStorageClient,
-            createStorageCollectionClient,
-        } = this._getStorageClientFactories(apiClient, storageConstructorName);
+    protected async _getOrCreateStorage(
+        storageIdOrName: string,
+        storageConstructorName: string,
+        apiClient: StorageClient,
+    ) {
+        const { createStorageClient, createStorageCollectionClient } = this._getStorageClientFactories(
+            apiClient,
+            storageConstructorName,
+        );
 
         const storageClient = createStorageClient(storageIdOrName);
         const existingStorage = await storageClient.get();
@@ -116,7 +128,7 @@ export class StorageManager<T extends IStorage = IStorage> {
 
     protected _getStorageClientFactories(client: StorageClient, storageConstructorName: string) {
         // Dataset => dataset
-        const clientName = storageConstructorName[0].toLowerCase() + storageConstructorName.slice(1) as ClientNames;
+        const clientName = (storageConstructorName[0].toLowerCase() + storageConstructorName.slice(1)) as ClientNames;
         // dataset => datasets
         const collectionClientName = `${clientName}s` as ClientCollectionNames;
 
@@ -145,4 +157,16 @@ export interface StorageManagerOptions {
      * SDK configuration instance, defaults to the static register.
      */
     config?: Configuration;
+
+    /**
+     * Optional storage client that should be used to open storages.
+     */
+    storageClient?: StorageClient;
+
+    /**
+     * Used to pass the proxy configuration for the `requestsFromUrl` objects.
+     * Takes advantage of the internal address rotation and authentication process.
+     * If undefined, the `requestsFromUrl` requests will be made without proxy.
+     */
+    proxyConfiguration?: ProxyConfiguration;
 }

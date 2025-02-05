@@ -1,9 +1,11 @@
-import { dirname } from 'node:path';
-import { fileURLToPath } from 'node:url';
+/* eslint-disable no-loop-func */
+import { execSync } from 'node:child_process';
 import { once } from 'node:events';
 import { readdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { isMainThread, Worker, workerData } from 'node:worker_threads';
-import { execSync } from 'node:child_process';
+
 import { colors, getApifyToken, clearPackages, clearStorage, SKIPPED_TEST_CLOSE_CODE } from './tools.mjs';
 
 const basePath = dirname(fileURLToPath(import.meta.url));
@@ -32,8 +34,6 @@ async function run() {
     if (!['LOCAL', 'MEMORY', 'PLATFORM'].includes(process.env.STORAGE_IMPLEMENTATION)) {
         throw new Error(`Unknown storage provided: '${process.env.STORAGE_IMPLEMENTATION}'`);
     }
-
-    execSync(`npm install --no-save @apify/storage-local`, { stdio: 'inherit' });
 
     console.log(`Running E2E tests with storage implementation '${process.env.STORAGE_IMPLEMENTATION}'`);
 
@@ -76,12 +76,19 @@ async function run() {
             }
 
             if (!seenFirst) {
-                console.log(`${colors.red('[fatal]')} test ${colors.yellow(`[${dir.name}]`)} did not call "initialize(import.meta.url)"!`);
+                console.log(
+                    `${colors.red('[fatal]')} test ${colors.yellow(
+                        `[${dir.name}]`,
+                    )} did not call "initialize(import.meta.url)"!`,
+                );
                 worker.terminate();
                 return;
             }
 
-            if (process.env.STORAGE_IMPLEMENTATION === 'PLATFORM' && (str.startsWith('[build]') || str.startsWith('[run]') || str.startsWith('[kv]'))) {
+            if (
+                process.env.STORAGE_IMPLEMENTATION === 'PLATFORM' &&
+                (str.startsWith('[build]') || str.startsWith('[run]') || str.startsWith('[kv]'))
+            ) {
                 const platformStatsMessage = str.match(/\[(?:run|build|kv)] (.*)/);
                 if (platformStatsMessage) {
                     console.log(`${colors.yellow(`[${dir.name}] `)}${colors.grey(platformStatsMessage[1])}`);
@@ -95,6 +102,13 @@ async function run() {
                 console.log(`${colors.yellow(`[${dir.name}] `)}${match[2]}: ${c(match[1])}`);
             }
         });
+
+        worker.on('error', (err) => {
+            // If the worker emits any error, we want to exit with a non-zero code
+            failure = true;
+            console.log(`${colors.red('[fatal]')} test ${colors.yellow(`[${dir.name}]`)} failed with error: ${err}`);
+        });
+
         worker.on('exit', async (code) => {
             if (code === SKIPPED_TEST_CLOSE_CODE) {
                 console.log(`Test ${colors.yellow(`[${dir.name}]`)} was skipped`);
@@ -104,7 +118,11 @@ async function run() {
             const took = (Date.now() - now) / 1000;
             const status = code === 0 ? 'success' : 'failure';
             const color = code === 0 ? 'green' : 'red';
-            console.log(`${colors.yellow(`[${dir.name}] `)}${colors[color](`Test finished with status: ${status} `)}${colors.grey(`[took ${took}s]`)}`);
+            console.log(
+                `${colors.yellow(`[${dir.name}] `)}${colors[color](
+                    `Test finished with status: ${status} `,
+                )}${colors.grey(`[took ${took}s]`)}`,
+            );
 
             if (['MEMORY', 'LOCAL'].includes(process.env.STORAGE_IMPLEMENTATION)) {
                 await clearStorage(`${basePath}/${dir.name}`);
@@ -122,12 +140,27 @@ async function run() {
 
             if (status === 'failure') failure = true;
         });
+
         await once(worker, 'exit');
     }
 }
 
 if (isMainThread) {
-    await run();
+    try {
+        if (process.env.STORAGE_IMPLEMENTATION === 'LOCAL') {
+            console.log('Temporary installing @apify/storage-local');
+            execSync(`yarn add -D @apify/storage-local@^2.1.3-beta.1 > /dev/null`, { stdio: 'inherit' });
+        }
+        await run();
+    } catch (e) {
+        console.error(e);
+    } finally {
+        if (process.env.STORAGE_IMPLEMENTATION === 'LOCAL') {
+            console.log('Removing temporary installation of @apify/storage-local');
+            execSync(`yarn remove @apify/storage-local > /dev/null`, { stdio: 'inherit' });
+        }
+    }
+
     // We want to exit with non-zero code if any of the tests failed
     if (failure) process.exit(1);
 } else {

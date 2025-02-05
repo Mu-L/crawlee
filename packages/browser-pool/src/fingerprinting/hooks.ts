@@ -1,11 +1,12 @@
 import type { BrowserFingerprintWithHeaders } from 'fingerprint-generator';
 import type { FingerprintInjector } from 'fingerprint-injector';
-import type { BrowserPool } from '..';
-import { PuppeteerPlugin } from '../puppeteer/puppeteer-plugin';
-import { PlaywrightPlugin } from '../playwright/playwright-plugin';
-import type { BrowserController } from '../abstract-classes/browser-controller';
-import type { LaunchContext } from '../launch-context';
+
 import { getGeneratorDefaultOptions } from './utils';
+import type { BrowserController } from '../abstract-classes/browser-controller';
+import type { BrowserPool } from '../browser-pool';
+import type { LaunchContext } from '../launch-context';
+import { PlaywrightPlugin } from '../playwright/playwright-plugin';
+import { PuppeteerPlugin } from '../puppeteer/puppeteer-plugin';
 
 /**
  * @internal
@@ -14,9 +15,7 @@ export function createFingerprintPreLaunchHook(browserPool: BrowserPool<any, any
     const {
         fingerprintGenerator,
         fingerprintCache,
-        fingerprintOptions: {
-            fingerprintGeneratorOptions,
-        },
+        fingerprintOptions: { fingerprintGeneratorOptions },
     } = browserPool;
 
     return (_pageId: string, launchContext: LaunchContext) => {
@@ -25,8 +24,9 @@ export function createFingerprintPreLaunchHook(browserPool: BrowserPool<any, any
         const { launchOptions }: { launchOptions: any } = launchContext;
 
         // If no options are passed we try to pass best default options as possible to match browser and OS.
-        const fingerprintGeneratorFinalOptions = fingerprintGeneratorOptions || getGeneratorDefaultOptions(launchContext);
-        let fingerprint : BrowserFingerprintWithHeaders;
+        const fingerprintGeneratorFinalOptions =
+            fingerprintGeneratorOptions || getGeneratorDefaultOptions(launchContext);
+        let fingerprint: BrowserFingerprintWithHeaders;
 
         if (cacheKey && fingerprintCache?.has(cacheKey)) {
             fingerprint = fingerprintCache.get(cacheKey)!;
@@ -42,7 +42,10 @@ export function createFingerprintPreLaunchHook(browserPool: BrowserPool<any, any
         if (useIncognitoPages) {
             return;
         }
-        const { navigator: { userAgent }, screen } = fingerprint.fingerprint!;
+        const {
+            navigator: { userAgent },
+            screen,
+        } = fingerprint.fingerprint!;
 
         launchOptions.userAgent = userAgent;
 
@@ -62,8 +65,8 @@ export function createPrePageCreateHook() {
         const { fingerprint } = launchContext.fingerprint!;
 
         if (launchContext.useIncognitoPages && browserPlugin instanceof PlaywrightPlugin && pageOptions) {
-            pageOptions.userAgent = fingerprint.navigator.userAgent;
-            pageOptions.viewport = {
+            pageOptions.userAgent ??= fingerprint.navigator.userAgent;
+            pageOptions.viewport ??= {
                 width: fingerprint.screen.width,
                 height: fingerprint.screen.height,
             };

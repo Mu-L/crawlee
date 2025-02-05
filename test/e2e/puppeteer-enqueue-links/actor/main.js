@@ -1,21 +1,25 @@
 import { Actor } from 'apify';
 import { Dataset, PuppeteerCrawler } from '@crawlee/puppeteer';
 import deepEqual from 'deep-equal';
-import { ApifyStorageLocal } from '@apify/storage-local';
 
 const mainOptions = {
     exit: Actor.isAtHome(),
-    storage: process.env.STORAGE_IMPLEMENTATION === 'LOCAL' ? new ApifyStorageLocal() : undefined,
+    storage:
+        process.env.STORAGE_IMPLEMENTATION === 'LOCAL'
+            ? new (await import('@apify/storage-local')).ApifyStorageLocal()
+            : undefined,
 };
 
 await Actor.main(async () => {
     const crawler = new PuppeteerCrawler({
         maxRequestsPerCrawl: 30,
-        async requestHandler({ page, enqueueLinks, request, log }) {
+        async requestHandler({ page, enqueueLinks, request, log, closeCookieModals }) {
             const { url, loadedUrl } = request;
 
             const pageTitle = await page.title();
             log.info(`URL: ${url}; LOADED_URL: ${loadedUrl}; TITLE: ${pageTitle}`);
+
+            await closeCookieModals();
 
             const results = await enqueueLinks();
 

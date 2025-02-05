@@ -1,16 +1,20 @@
 /* eslint-disable import/no-duplicates */
-import type * as storage from '@crawlee/types';
-import type { Dictionary } from '@crawlee/types';
-import { s } from '@sapphire/shapeshift';
 import { randomUUID } from 'node:crypto';
 import { rm } from 'node:fs/promises';
 import { resolve } from 'node:path';
+
+import type { Dictionary } from '@crawlee/types';
+import type * as storage from '@crawlee/types';
+import { s } from '@sapphire/shapeshift';
 import { move } from 'fs-extra';
-import type { MemoryStorage } from '../index';
-import { StorageTypes } from '../consts';
-import { BaseClient } from './common/base-client';
-import { sendWorkerMessage } from '../workers/instance';
+
+import { scheduleBackgroundTask } from '../background-handler';
 import { findOrCacheDatasetByPossibleId } from '../cache-helpers';
+import { StorageTypes } from '../consts';
+import type { StorageImplementation } from '../fs/common';
+import { createDatasetStorageImplementation } from '../fs/dataset';
+import type { MemoryStorage } from '../index';
+import { BaseClient } from './common/base-client';
 
 /**
  * This is what API returns in the x-apify-pagination-limit
@@ -31,7 +35,10 @@ export interface DatasetClientOptions {
     client: MemoryStorage;
 }
 
-export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseClient implements storage.DatasetClient<Data> {
+export class DatasetClient<Data extends Dictionary = Dictionary>
+    extends BaseClient
+    implements storage.DatasetClient<Data>
+{
     name?: string;
     createdAt = new Date();
     accessedAt = new Date();
@@ -39,7 +46,7 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
     itemCount = 0;
     datasetDirectory: string;
 
-    private readonly datasetEntries = new Map<string, Data>();
+    private readonly datasetEntries = new Map<string, StorageImplementation<Data>>();
     private readonly client: MemoryStorage;
 
     constructor(options: DatasetClientOptions) {
@@ -61,9 +68,11 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
     }
 
     async update(newFields: storage.DatasetClientUpdateOptions = {}): Promise<storage.DatasetInfo> {
-        const parsed = s.object({
-            name: s.string.lengthGreaterThan(0).optional,
-        }).parse(newFields);
+        const parsed = s
+            .object({
+                name: s.string.lengthGreaterThan(0).optional,
+            })
+            .parse(newFields);
 
         // Check by id
         const existingStoreById = await findOrCacheDatasetByPossibleId(this.client, this.name ?? this.id);
@@ -78,7 +87,9 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
         }
 
         // Check that name is not in use already
-        const existingStoreByName = this.client.datasetClientsHandled.find((store) => store.name?.toLowerCase() === parsed.name!.toLowerCase());
+        const existingStoreByName = this.client.datasetClientsHandled.find(
+            (store) => store.name?.toLowerCase() === parsed.name!.toLowerCase(),
+        );
 
         if (existingStoreByName) {
             this.throwOnDuplicateEntry(StorageTypes.Dataset, 'name', parsed.name);
@@ -88,7 +99,10 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
 
         const previousDir = existingStoreById.datasetDirectory;
 
-        existingStoreById.datasetDirectory = resolve(this.client.datasetsDirectory, parsed.name ?? existingStoreById.name ?? existingStoreById.id);
+        existingStoreById.datasetDirectory = resolve(
+            this.client.datasetsDirectory,
+            parsed.name ?? existingStoreById.name ?? existingStoreById.id,
+        );
 
         await move(previousDir, existingStoreById.datasetDirectory, { overwrite: true });
 
@@ -119,11 +133,13 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
             limit = LIST_ITEMS_LIMIT,
             offset = 0,
             desc,
-        } = s.object({
-            desc: s.boolean.optional,
-            limit: s.number.int.optional,
-            offset: s.number.int.optional,
-        }).parse(options);
+        } = s
+            .object({
+                desc: s.boolean.optional,
+                limit: s.number.int.optional,
+                offset: s.number.int.optional,
+            })
+            .parse(options);
 
         // Check by id
         const existingStoreById = await findOrCacheDatasetByPossibleId(this.client, this.name ?? this.id);
@@ -141,7 +157,7 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
 
         for (let idx = start; idx < end; idx++) {
             const entryNumber = this.generateLocalEntryName(idx);
-            items.push(existingStoreById.datasetEntries.get(entryNumber)!);
+            items.push(await existingStoreById.datasetEntries.get(entryNumber)!.get());
         }
 
         existingStoreById.updateTimestamps(false);
@@ -157,11 +173,13 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
     }
 
     async pushItems(items: string | Data | string[] | Data[]): Promise<void> {
-        const rawItems = s.union(
-            s.string,
-            s.object<Data>({} as Data).passthrough,
-            s.array(s.union(s.string, s.object<Data>({} as Data).passthrough)),
-        ).parse(items) as Data[];
+        const rawItems = s
+            .union(
+                s.string,
+                s.object<Data>({} as Data).passthrough,
+                s.array(s.union(s.string, s.object<Data>({} as Data).passthrough)),
+            )
+            .parse(items) as Data[];
 
         // Check by id
         const existingStoreById = await findOrCacheDatasetByPossibleId(this.client, this.name ?? this.id);
@@ -176,23 +194,19 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
 
         for (const entry of normalized) {
             const idx = this.generateLocalEntryName(++existingStoreById.itemCount);
+            const storageEntry = createDatasetStorageImplementation({
+                entityId: idx,
+                persistStorage: this.client.persistStorage,
+                storeDirectory: existingStoreById.datasetDirectory,
+            });
 
-            existingStoreById.datasetEntries.set(idx, entry);
+            await storageEntry.update(entry);
+
+            existingStoreById.datasetEntries.set(idx, storageEntry);
             addedIds.push(idx);
         }
 
-        const dataEntries: [string, Dictionary][] = addedIds.map((id) => [id, existingStoreById.datasetEntries.get(id)!]);
-
         existingStoreById.updateTimestamps(true);
-        sendWorkerMessage({
-            data: dataEntries,
-            action: 'update-entries',
-            entityType: 'datasets',
-            entityDirectory: existingStoreById.datasetDirectory,
-            id: existingStoreById.name ?? existingStoreById.id,
-            writeMetadata: this.client.writeMetadata,
-            persistStorage: this.client.persistStorage,
-        });
     }
 
     toDatasetInfo(): storage.DatasetInfo {
@@ -228,9 +242,7 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
             items = JSON.parse(items);
         }
 
-        return Array.isArray(items)
-            ? items.map((item) => this.normalizeItem(item))
-            : [this.normalizeItem(items)];
+        return Array.isArray(items) ? items.map((item) => this.normalizeItem(item)) : [this.normalizeItem(items)];
     }
 
     private normalizeItem(item: string | Data): Data {
@@ -239,7 +251,9 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
         }
 
         if (Array.isArray(item)) {
-            throw new Error(`Each dataset item can only be a single JSON object, not an array. Received: [${item.join(',\n')}]`);
+            throw new Error(
+                `Each dataset item can only be a single JSON object, not an array. Received: [${item.join(',\n')}]`,
+            );
         }
 
         if (typeof item !== 'object' || item === null) {
@@ -257,7 +271,7 @@ export class DatasetClient<Data extends Dictionary = Dictionary> extends BaseCli
         }
 
         const data = this.toDatasetInfo();
-        sendWorkerMessage({
+        scheduleBackgroundTask({
             action: 'update-metadata',
             data,
             entityType: 'datasets',
